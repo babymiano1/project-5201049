@@ -1,11 +1,16 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
+import { useVideoAnalysis } from '../../contexts/VideoAnalysisContext';
+
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
 export default function AIParsing() {
   const navigate = useNavigate();
   const location = useLocation();
+  const { state, setAnalysisResult, setIsAnalyzing, setError } = useVideoAnalysis();
   const [progress, setProgress] = useState(0);
   const [currentTask, setCurrentTask] = useState(0);
+  const analysisCalledRef = useRef(false);
 
   const tasks = [
     { id: 1, name: '动作语义解析', icon: 'ri-hand-heart-line' },
@@ -14,13 +19,72 @@ export default function AIParsing() {
     { id: 4, name: '生成创作任务', icon: 'ri-magic-line' },
   ];
 
+  // 调用 API 分析视频
+  const analyzeVideo = useCallback(async () => {
+    if (!state.videoFile) return;
+
+    setIsAnalyzing(true);
+    setError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append('video', state.videoFile);
+
+      const response = await fetch(`${API_BASE_URL}/api/analyze`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || '分析失败');
+      }
+
+      // 保存分析结果到全局状态
+      setAnalysisResult(result.data);
+      console.log('分析结果:', result.data);
+    } catch (err) {
+      console.error('分析视频时出错:', err);
+      setError(err instanceof Error ? err.message : '分析视频时发生未知错误');
+    } finally {
+      setIsAnalyzing(false);
+    }
+  }, [state.videoFile, setIsAnalyzing, setError, setAnalysisResult]);
+
+  // 调用 API 分析视频
+  useEffect(() => {
+    // 如果没有视频文件，检查是否是示例视频
+    if (!state.videoFile && !location.state?.exampleId) {
+      // 如果没有视频文件且不是示例，返回首页
+      navigate('/');
+      return;
+    }
+
+    // 如果是示例视频，跳过 API 调用
+    if (location.state?.exampleId) {
+      return;
+    }
+
+    // 只在进度达到 50% 时调用一次 API
+    if (progress >= 50 && !analysisCalledRef.current && state.videoFile) {
+      analysisCalledRef.current = true;
+      analyzeVideo();
+    }
+  }, [progress, state.videoFile, location.state, navigate, analyzeVideo]);
+
   useEffect(() => {
     const interval = setInterval(() => {
       setProgress((prev) => {
         if (prev >= 100) {
           clearInterval(interval);
           setTimeout(() => {
-            navigate('/creation-setup');
+            // 跳转到创作设置页，并通过 state 携带 action_script 数据
+            navigate('/creation-setup', {
+              state: {
+                actionScript: state.analysisResult || null
+              }
+            });
           }, 500);
           return 100;
         }
@@ -29,7 +93,7 @@ export default function AIParsing() {
     }, 100);
 
     return () => clearInterval(interval);
-  }, [navigate]);
+  }, [navigate, state.analysisResult]);
 
   useEffect(() => {
     const taskIndex = Math.floor(progress / 25);
@@ -78,6 +142,13 @@ export default function AIParsing() {
               <div className="text-lg text-white/60 font-medium">
                 {tasks[currentTask].name}
               </div>
+              
+              {/* Error message */}
+              {state.error && (
+                <div className="mt-4 px-4 py-2 bg-red-500/20 border border-red-500/30 rounded-lg">
+                  <p className="text-sm text-red-400">{state.error}</p>
+                </div>
+              )}
             </div>
           </div>
         </div>

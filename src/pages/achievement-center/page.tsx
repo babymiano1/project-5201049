@@ -55,7 +55,7 @@ export default function AchievementCenter() {
             <i className="ri-arrow-left-line text-xl text-white/80"></i>
           </Link>
           <h1 className="text-xl font-bold text-white">成就中心</h1>
-          <Link to="/creator-lounge" className="w-12 h-12 rounded-full bg-white/5 backdrop-blur-md flex items-center justify-center border border-white/10 hover:bg-white/10 transition-colors cursor-pointer">
+          <Link to="/" className="w-12 h-12 rounded-full bg-white/5 backdrop-blur-md flex items-center justify-center border border-white/10 hover:bg-white/10 transition-colors cursor-pointer">
             <i className="ri-add-circle-line text-xl text-white/80"></i>
           </Link>
         </div>

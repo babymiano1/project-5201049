@@ -1,6 +1,6 @@
-
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Link } from 'react-router-dom';
+import { useVideoAnalysis, type ActionItem } from '../../contexts/VideoAnalysisContext';
 
 // 粒子类型
 interface Particle {
@@ -18,10 +18,11 @@ interface Particle {
 // 动作提示类型
 interface ActionHint {
   id: number;
-  icon: string;
-  text: string;
-  time: number;
+  action_tag: string;
+  description: string;
+  timestamp: number; // 改为使用视频时间戳（秒），而非 Date.now()
   color: string;
+  icon: string;
 }
 
 // 音符气泡类型
@@ -32,9 +33,108 @@ interface NoteBubble {
   size: number;
   opacity: number;
   delay: number;
+  color: string;
+  targetTime?: number; // 目标时间（rhythm_point 的时间戳，用于精确同步）
+}
+
+// Action Tag 到视觉配置的映射
+const ACTION_TAG_CONFIG: Record<string, { icon: string; color: string; bubbleColor: string }> = {
+  'POINT': {
+    icon: '👆',
+    color: 'from-blue-400 to-cyan-400',
+    bubbleColor: 'from-blue-400 to-cyan-400'
+  },
+  'PUSH': {
+    icon: '✋',
+    color: 'from-purple-400 to-pink-400',
+    bubbleColor: 'from-purple-400 to-pink-400'
+  },
+  'PULL': {
+    icon: '✋',
+    color: 'from-purple-400 to-pink-400',
+    bubbleColor: 'from-purple-400 to-pink-400'
+  },
+  'SWIPE': {
+    icon: '↔️',
+    color: 'from-teal-400 to-cyan-400',
+    bubbleColor: 'from-teal-400 to-cyan-400'
+  },
+  'WAVE': {
+    icon: '👋',
+    color: 'from-cyan-400 to-blue-400',
+    bubbleColor: 'from-cyan-400 to-blue-400'
+  },
+  'ROLL': {
+    icon: '🌊',
+    color: 'from-cyan-400 to-blue-400',
+    bubbleColor: 'from-cyan-400 to-blue-400'
+  },
+  'CLAP': {
+    icon: '👏',
+    color: 'from-purple-400 to-pink-400',
+    bubbleColor: 'from-purple-400 to-pink-400'
+  },
+  'PUNCH': {
+    icon: '👊',
+    color: 'from-red-400 to-pink-400',
+    bubbleColor: 'from-red-400 to-pink-400'
+  },
+  'HEART': {
+    icon: '❤️',
+    color: 'from-pink-400 to-rose-400',
+    bubbleColor: 'from-pink-400 to-rose-400'
+  },
+  'FRAME': {
+    icon: '🖼️',
+    color: 'from-indigo-400 to-purple-400',
+    bubbleColor: 'from-indigo-400 to-purple-400'
+  },
+  'SPIN': {
+    icon: '🔄',
+    color: 'from-green-400 to-teal-400',
+    bubbleColor: 'from-green-400 to-teal-400'
+  },
+  'CIRCLE': {
+    icon: '⭕',
+    color: 'from-green-400 to-teal-400',
+    bubbleColor: 'from-green-400 to-teal-400'
+  },
+  'GREET': {
+    icon: '👋',
+    color: 'from-cyan-400 to-blue-400',
+    bubbleColor: 'from-cyan-400 to-blue-400'
+  },
+};
+
+// 默认配置
+const DEFAULT_CONFIG = {
+  icon: '✨',
+  color: 'from-gray-400 to-gray-500',
+  bubbleColor: 'from-gray-400 to-gray-500'
+};
+
+// 将时间戳字符串转换为秒数
+function timestampToSeconds(timestamp: string): number {
+  const parts = timestamp.split(':');
+  if (parts.length === 2) {
+    const minutes = parseInt(parts[0], 10);
+    const seconds = parseFloat(parts[1]);
+    return minutes * 60 + seconds;
+  }
+  return 0;
 }
 
 export default function PerformanceStage() {
+  // 从 Context 获取分析结果
+  const { state: videoAnalysisState } = useVideoAnalysis();
+  
+  // 调试：打印 videoUrl 状态
+  useEffect(() => {
+    console.log('PerformanceStage - videoUrl:', videoAnalysisState.videoUrl);
+    console.log('PerformanceStage - videoFile:', videoAnalysisState.videoFile);
+    console.log('PerformanceStage - analysisResult:', videoAnalysisState.analysisResult?.length || 0, '个动作');
+  }, [videoAnalysisState.videoUrl, videoAnalysisState.videoFile, videoAnalysisState.analysisResult]);
+  
   // 状态管理
   const [stage, setStage] = useState<'tutorial' | 'countdown' | 'performing'>('tutorial');
   const [countdown, setCountdown] = useState(3);
@@ -50,18 +150,23 @@ export default function PerformanceStage() {
   const [lastGestureTime, setLastGestureTime] = useState(0);
 
   // Refs
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null); // 右侧：用户摄像头
+  const originalVideoRef = useRef<HTMLVideoElement>(null); // 左侧：原视频
+  const audioRef = useRef<HTMLAudioElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const particleIdRef = useRef(0);
   const actionIdRef = useRef(0);
   const bubbleIdRef = useRef(0);
-  const animationFrameRef = useRef<number>();
-  const gestureIntervalRef = useRef<number>();
+  const animationFrameRef = useRef<number | undefined>(undefined);
+  const gestureIntervalRef = useRef<number | undefined>(undefined);
+  const processedActionsRef = useRef<Set<number>>(new Set<number>());
+  const timeUpdateHandlerRef = useRef<(() => void) | null>(null);
 
   // 初始化摄像头
   useEffect(() => {
     const initCamera = async () => {
       try {
+        console.log('开始初始化摄像头...');
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             width: { ideal: 1280 },
@@ -71,10 +176,29 @@ export default function PerformanceStage() {
           audio: false
         });
 
+        console.log('摄像头流获取成功', stream);
         streamRef.current = stream;
         
+        // 确保 videoRef 已挂载
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
+          console.log('摄像头流已绑定到 videoRef');
+          
+          // 确保视频播放
+          videoRef.current.play().catch(err => {
+            console.error('视频播放失败:', err);
+          });
+        } else {
+          console.warn('videoRef.current 为 null，延迟绑定');
+          // 延迟重试
+          setTimeout(() => {
+            if (videoRef.current && streamRef.current) {
+              videoRef.current.srcObject = streamRef.current;
+              videoRef.current.play().catch(err => {
+                console.error('延迟播放失败:', err);
+              });
+            }
+          }, 100);
         }
 
         setCameraPermission('granted');
@@ -97,17 +221,85 @@ export default function PerformanceStage() {
     initCamera();
 
     return () => {
+      // 停止摄像头流
       if (streamRef.current) {
         streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
       }
+      
+      // 取消动画帧
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = undefined;
       }
+      
+      // 清除定时器
       if (gestureIntervalRef.current) {
         clearInterval(gestureIntervalRef.current);
+        gestureIntervalRef.current = undefined;
       }
+      
+      // 停止音频播放
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.currentTime = 0;
+        audioRef.current.src = '';
+      }
+      
+      // 停止视频播放并移除事件监听器
+      if (originalVideoRef.current) {
+        if (timeUpdateHandlerRef.current) {
+          originalVideoRef.current.removeEventListener('timeupdate', timeUpdateHandlerRef.current);
+          timeUpdateHandlerRef.current = null;
+        }
+        originalVideoRef.current.pause();
+        originalVideoRef.current.currentTime = 0;
+        originalVideoRef.current.src = '';
+      }
+      
+      // 清理摄像头视频
+      if (videoRef.current) {
+        videoRef.current.pause();
+        videoRef.current.srcObject = null;
+      }
+      
+      // 清理状态
+      setParticles([]);
+      setActionHints([]);
+      setLeftBubbles([]);
+      setRightBubbles([]);
+      processedActionsRef.current.clear();
     };
   }, []);
+
+  // 修复摄像头切换失效：当 stage 切换到 performing 时重新绑定摄像头流
+  useEffect(() => {
+    if (stage === 'performing' && streamRef.current && videoRef.current) {
+      // 重新绑定摄像头流
+      videoRef.current.srcObject = streamRef.current;
+      videoRef.current.play().catch(err => {
+        console.error('摄像头视频播放失败:', err);
+      });
+      console.log('摄像头流已重新绑定到 performing 阶段的 videoRef');
+    }
+  }, [stage]);
+
+  // 当 stage 变化时处理音频和视频
+  useEffect(() => {
+    if (stage === 'tutorial') {
+      // 在教程阶段，暂停并重置音频和左侧视频
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current.currentTime = 0;
+      }
+      if (originalVideoRef.current) {
+        originalVideoRef.current.pause();
+        originalVideoRef.current.currentTime = 0;
+      }
+    }
+    // countdown 阶段不暂停，为 performing 阶段的立即播放做准备
+    // performing 阶段的音频和视频播放由 startPerformance 函数处理
+  }, [stage]);
 
   // 倒计时逻辑
   useEffect(() => {
@@ -116,59 +308,108 @@ export default function PerformanceStage() {
       return () => clearTimeout(timer);
     } else if (stage === 'countdown' && countdown === 0) {
       setStage('performing');
-      startPerformance();
     }
   }, [stage, countdown]);
 
   // 开始表演
-  const startPerformance = () => {
-    // 初始化音符气泡
-    initBubbles();
+  const startPerformance = useCallback(async () => {
+    processedActionsRef.current.clear();
     
-    // 开始动作提示流
-    startActionHints();
+    // 初始化音符气泡（初始为空，后续根据动作动态生成）
+    setLeftBubbles([]);
+    setRightBubbles([]);
     
-    // 开始手势检测模拟
+    // 同步播放音频和左侧原视频
+    if (audioRef.current && videoAnalysisState.videoUrl) {
+      try {
+        // 重置音频和视频到开始位置
+        audioRef.current.currentTime = 0;
+        if (originalVideoRef.current) {
+          originalVideoRef.current.currentTime = 0;
+        }
+        
+        // 同步播放音频和左侧视频
+        const playPromises = [
+          audioRef.current.play(),
+          originalVideoRef.current?.play()
+        ].filter(Boolean);
+        
+        await Promise.all(playPromises);
+        console.log('音频和视频同步播放开始');
+      } catch (error) {
+        console.error('播放失败:', error);
+        // 如果自动播放失败，可能需要用户交互
+      }
+    }
+    
+    // 开始基于 action_script 的手势检测（数据驱动）
     startGestureDetection();
-  };
+  }, [videoAnalysisState.videoUrl, videoAnalysisState.analysisResult]);
 
-  // 初始化音符气泡
-  const initBubbles = () => {
-    const createBubbles = (count: number) => {
-      return Array.from({ length: count }, (_, i) => ({
-        id: bubbleIdRef.current++,
-        y: -100 - (i * 150),
-        speed: 1 + Math.random() * 0.5,
-        size: 40 + Math.random() * 20,
-        opacity: 0.3 + Math.random() * 0.4,
-        delay: i * 0.2
-      }));
-    };
-
-    setLeftBubbles(createBubbles(10));
-    setRightBubbles(createBubbles(10));
-  };
-
-  // 更新音符气泡位置
+  // 当进入 performing 阶段时启动表演
   useEffect(() => {
-    if (stage !== 'performing') return;
+    if (stage === 'performing') {
+      startPerformance();
+    }
+  }, [stage, startPerformance]);
+
+  // 更新音符气泡位置（基于音频时间精确同步）
+  useEffect(() => {
+    if (stage !== 'performing' || !audioRef.current) return;
+
+    const JUDGE_LINE_Y = window.innerHeight * 0.2; // 判定线位置
 
     const updateBubbles = () => {
-      setLeftBubbles(prev => prev.map(bubble => {
-        let newY = bubble.y + bubble.speed;
-        if (newY > window.innerHeight + 100) {
-          newY = -100;
-        }
-        return { ...bubble, y: newY };
-      }));
+      const audioTime = audioRef.current?.currentTime || 0;
+      const deltaTime = 1 / 60; // 固定帧率 60fps
 
-      setRightBubbles(prev => prev.map(bubble => {
-        let newY = bubble.y + bubble.speed;
-        if (newY > window.innerHeight + 100) {
-          newY = -100;
-        }
-        return { ...bubble, y: newY };
-      }));
+      // 更新左侧气泡
+      setLeftBubbles(prev => prev
+        .map(bubble => {
+          // 如果有目标时间，进行精确同步检查
+          if (bubble.targetTime !== undefined) {
+            const timeDiff = audioTime - bubble.targetTime;
+            // 如果已经超过目标时间 0.2 秒，检查是否到达判定线
+            if (timeDiff > 0.2) {
+              // 如果气泡已经通过判定线，标记为已处理
+              if (bubble.y > JUDGE_LINE_Y + 50) {
+                return null;
+              }
+            }
+          }
+
+          let newY = bubble.y + bubble.speed * (deltaTime * 60);
+          if (newY > window.innerHeight + 100) {
+            return null;
+          }
+          return { ...bubble, y: newY };
+        })
+        .filter((bubble): bubble is NoteBubble => bubble !== null)
+      );
+
+      // 更新右侧气泡
+      setRightBubbles(prev => prev
+        .map(bubble => {
+          // 如果有目标时间，进行精确同步检查
+          if (bubble.targetTime !== undefined) {
+            const timeDiff = audioTime - bubble.targetTime;
+            // 如果已经超过目标时间 0.2 秒，检查是否到达判定线
+            if (timeDiff > 0.2) {
+              // 如果气泡已经通过判定线，标记为已处理
+              if (bubble.y > JUDGE_LINE_Y + 50) {
+                return null;
+              }
+            }
+          }
+
+          let newY = bubble.y + bubble.speed * (deltaTime * 60);
+          if (newY > window.innerHeight + 100) {
+            return null;
+          }
+          return { ...bubble, y: newY };
+        })
+        .filter((bubble): bubble is NoteBubble => bubble !== null)
+      );
 
       animationFrameRef.current = requestAnimationFrame(updateBubbles);
     };
@@ -182,85 +423,210 @@ export default function PerformanceStage() {
     };
   }, [stage]);
 
-  // 开始动作提示流
-  const startActionHints = () => {
-    const actions = [
-      { icon: '👋', text: '挥手', color: 'from-cyan-400 to-blue-400' },
-      { icon: '👏', text: '拍手', color: 'from-purple-400 to-pink-400' },
-      { icon: '🔄', text: '转圈', color: 'from-teal-400 to-cyan-400' },
-      { icon: '✌️', text: '比耶', color: 'from-pink-400 to-rose-400' },
-      { icon: '👆', text: '指向上', color: 'from-blue-400 to-cyan-400' },
-    ];
+  // 基于视频时间轴同步动作提示（监听视频 onTimeUpdate 事件）
+  useEffect(() => {
+    if (stage !== 'performing' || !videoAnalysisState.analysisResult || !originalVideoRef.current) return;
 
-    let index = 0;
-    const addHint = () => {
-      const action = actions[index % actions.length];
-      setActionHints(prev => [...prev, {
-        id: actionIdRef.current++,
-        ...action,
-        time: Date.now()
-      }]);
-      index++;
+    const actionScript = videoAnalysisState.analysisResult;
+    if (actionScript.length === 0) {
+      console.warn('actionScript 为空，无法生成动作提示');
+      return;
+    }
+
+    console.log('开始监听动作脚本，共', actionScript.length, '个动作');
+
+    const handleTimeUpdate = () => {
+      const video = originalVideoRef.current;
+      if (!video || video.paused) return;
+
+      const currentTime = video.currentTime;
+
+      // 遍历动作脚本，检查是否有需要显示的动作
+      actionScript.forEach((action: ActionItem) => {
+        const actionTime = timestampToSeconds(action.timestamp);
+        const timeDiff = currentTime - actionTime;
+
+        // 在动作时间点前后 0.1 秒内触发，且未处理过
+        if (timeDiff >= -0.1 && timeDiff <= 0.1 && !processedActionsRef.current.has(action.id)) {
+          processedActionsRef.current.add(action.id);
+
+          // 获取视觉配置
+          const config = ACTION_TAG_CONFIG[action.action_tag] || DEFAULT_CONFIG;
+
+          // 添加到动作提示流（使用视频时间戳）
+          setActionHints(prev => [...prev, {
+            id: action.id,
+            action_tag: action.action_tag,
+            description: action.description,
+            timestamp: actionTime, // 使用视频时间戳
+            color: config.color,
+            icon: config.icon
+          }]);
+
+          // 如果是节奏点，生成音符气泡（数据驱动，精确卡点）
+          if (action.rhythm_point) {
+            const bubbleConfig = ACTION_TAG_CONFIG[action.action_tag] || DEFAULT_CONFIG;
+            
+            // 使用 action.id 的奇偶性来决定左右，确保一致性
+            const isLeft = action.id % 2 === 0;
+            
+            // 计算气泡速度，确保 rhythm_point 准确经过判定线
+            const JUDGE_LINE_Y = window.innerHeight * 0.2;
+            const BUBBLE_START_Y = -50;
+            const DISTANCE_TO_JUDGE_LINE = JUDGE_LINE_Y - BUBBLE_START_Y;
+            
+            // 计算从当前时间到 rhythm_point 时间的时间差
+            const timeUntilRhythmPoint = actionTime - currentTime;
+            
+            // 提前 0.5 秒到 5 秒内生成气泡
+            if (timeUntilRhythmPoint >= -0.5 && timeUntilRhythmPoint <= 5) {
+              const actualTimeUntil = Math.max(0.1, timeUntilRhythmPoint);
+              
+              // 计算气泡速度
+              const speedPerSecond = DISTANCE_TO_JUDGE_LINE / actualTimeUntil;
+              const speedPerFrame = speedPerSecond / 60;
+              
+              // 限制速度范围
+              const minSpeed = 0.5;
+              const maxSpeed = 8.0;
+              const clampedSpeed = Math.max(minSpeed, Math.min(maxSpeed, speedPerFrame));
+              
+              const newBubble: NoteBubble = {
+                id: bubbleIdRef.current++,
+                y: BUBBLE_START_Y,
+                speed: clampedSpeed,
+                size: 30 + action.intensity * 3,
+                opacity: 0.5 + (action.intensity / 10) * 0.3,
+                delay: 0,
+                color: bubbleConfig.bubbleColor,
+                targetTime: actionTime
+              };
+              
+              console.log('生成音符气泡:', {
+                action_tag: action.action_tag,
+                timeUntilRhythmPoint,
+                speed: clampedSpeed,
+                size: newBubble.size,
+                isLeft
+              });
+              
+              if (isLeft) {
+                setLeftBubbles(prev => [...prev, newBubble]);
+              } else {
+                setRightBubbles(prev => [...prev, newBubble]);
+              }
+            }
+          }
+        }
+      });
     };
 
-    // 初始添加几个
-    addHint();
-    setTimeout(addHint, 1500);
-    setTimeout(addHint, 3000);
+    // 监听视频的 timeupdate 事件
+    const video = originalVideoRef.current;
+    timeUpdateHandlerRef.current = handleTimeUpdate;
+    video.addEventListener('timeupdate', handleTimeUpdate);
 
-    // 定期添加新的
-    const interval = setInterval(addHint, 2500);
+    return () => {
+      if (video && timeUpdateHandlerRef.current) {
+        video.removeEventListener('timeupdate', timeUpdateHandlerRef.current);
+        timeUpdateHandlerRef.current = null;
+      }
+    };
+  }, [stage, videoAnalysisState.analysisResult]);
 
-    return () => clearInterval(interval);
-  };
-
-  // 清理过期的动作提示
+  // 清理过期的动作提示（基于视频时间）
   useEffect(() => {
-    if (stage !== 'performing') return;
+    if (stage !== 'performing' || !originalVideoRef.current) return;
 
-    const cleanup = setInterval(() => {
-      const now = Date.now();
-      setActionHints(prev => prev.filter(hint => now - hint.time < 8000));
-    }, 1000);
+    const cleanup = () => {
+      const video = originalVideoRef.current;
+      if (!video) return;
+      
+      const currentTime = video.currentTime;
+      // 移除 8 秒前的动作提示
+      setActionHints(prev => prev.filter(hint => currentTime - hint.timestamp < 8));
+    };
 
-    return () => clearInterval(cleanup);
+    const video = originalVideoRef.current;
+    video.addEventListener('timeupdate', cleanup);
+
+    return () => {
+      video.removeEventListener('timeupdate', cleanup);
+    };
   }, [stage]);
 
-  // 模拟手势检测
+  // 基于 action_script 的手势检测（数据驱动）
   const startGestureDetection = () => {
-    gestureIntervalRef.current = window.setInterval(() => {
-      // 随机触发手势检测（模拟）
-      if (Math.random() > 0.7) {
-        triggerGesture();
-      }
-    }, 1500);
+    if (!videoAnalysisState.analysisResult || !audioRef.current) return;
+
+    const actionScript = videoAnalysisState.analysisResult;
+    
+    // 基于音频时间检查动作，触发手势效果
+    const checkGestures = () => {
+      const currentTime = audioRef.current?.currentTime || 0;
+
+      actionScript.forEach((action: ActionItem) => {
+        const actionTime = timestampToSeconds(action.timestamp);
+        const timeDiff = currentTime - actionTime;
+
+        // 在动作时间点触发手势效果（数据驱动）
+        if (timeDiff >= 0 && timeDiff <= 0.2 && !processedActionsRef.current.has(action.id + 10000)) {
+          processedActionsRef.current.add(action.id + 10000);
+          triggerGesture(action);
+        }
+      });
+    };
+
+    // 每 50ms 检查一次
+    gestureIntervalRef.current = window.setInterval(checkGestures, 50);
   };
 
-  // 触发手势效果
-  const triggerGesture = () => {
+  // 触发手势效果（基于 action 数据）
+  const triggerGesture = (action: ActionItem) => {
     const now = Date.now();
-    if (now - lastGestureTime < 500) return; // 防止过于频繁
+    if (now - lastGestureTime < 300) return; // 防止过于频繁
     
     setLastGestureTime(now);
     setHandDetected(true);
     setTimeout(() => setHandDetected(false), 300);
 
-    // 增加分数和连击
-    setScore(prev => prev + 100);
-    setCombo(prev => prev + 1);
+    // 根据 intensity 计算分数（数据驱动）
+    const baseScore = 50 + action.intensity * 10;
+    setScore(prev => prev + baseScore);
+    
+    // 如果是节奏点，增加连击
+    if (action.rhythm_point) {
+      setCombo(prev => prev + 1);
+    }
 
-    // 生成粒子
-    createParticles(200, 300);
+    // 生成粒子（基于 action_tag 的颜色）
+    const config = ACTION_TAG_CONFIG[action.action_tag] || DEFAULT_CONFIG;
+    createParticles(200, 300, config.color, action.intensity);
   };
 
-  // 创建粒子
-  const createParticles = (x: number, y: number) => {
-    const colors = ['#06b6d4', '#8b5cf6', '#ec4899', '#14b8a6', '#f59e0b'];
+  // 创建粒子（基于 action_tag 和 intensity，数据驱动）
+  const createParticles = (x: number, y: number, colorGradient: string, intensity: number) => {
+    // 从渐变色字符串中提取主要颜色（简化处理）
+    const colorMap: Record<string, string> = {
+      'from-blue-400 to-cyan-400': '#06b6d4',
+      'from-purple-400 to-pink-400': '#8b5cf6',
+      'from-yellow-400 to-orange-400': '#f59e0b',
+      'from-pink-400 to-rose-400': '#ec4899',
+      'from-green-400 to-teal-400': '#14b8a6',
+      'from-red-400 to-pink-400': '#ef4444',
+      'from-indigo-400 to-purple-400': '#6366f1',
+      'from-teal-400 to-cyan-400': '#14b8a6',
+      'from-gray-400 to-gray-500': '#9ca3af',
+    };
+    
+    const particleColor = colorMap[colorGradient] || '#8b5cf6';
+    const particleCount = 15 + Math.floor(intensity / 2); // 基于 intensity 决定粒子数量
     const newParticles: Particle[] = [];
 
-    for (let i = 0; i < 20; i++) {
-      const angle = (Math.PI * 2 * i) / 20;
-      const speed = 2 + Math.random() * 3;
+    for (let i = 0; i < particleCount; i++) {
+      const angle = (Math.PI * 2 * i) / particleCount;
+      // 速度基于 intensity（1-10），映射到 2-4
+      const speed = 2 + (intensity / 10) * 2;
       
       newParticles.push({
         id: particleIdRef.current++,
@@ -269,9 +635,9 @@ export default function PerformanceStage() {
         vx: Math.cos(angle) * speed,
         vy: Math.sin(angle) * speed,
         life: 1,
-        maxLife: 60 + Math.random() * 40,
-        color: colors[Math.floor(Math.random() * colors.length)],
-        size: 4 + Math.random() * 6
+        maxLife: 50 + intensity * 5, // 基于 intensity 决定生命周期
+        color: particleColor,
+        size: 4 + (intensity / 10) * 4 // 基于 intensity 决定大小
       });
     }
 
@@ -349,6 +715,23 @@ export default function PerformanceStage() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 relative overflow-hidden font-['Inter',sans-serif]">
+      {/* 隐藏的音频标签 */}
+      {videoAnalysisState.videoUrl && (
+        <audio
+          ref={audioRef}
+          src={videoAnalysisState.videoUrl}
+          preload="auto"
+          className="hidden"
+          onEnded={() => {
+            console.log('音频播放结束');
+            // 可以在这里添加播放结束的处理逻辑
+          }}
+          onError={(e) => {
+            console.error('音频加载错误:', e);
+          }}
+        />
+      )}
+
       {/* 背景装饰 */}
       <div className="absolute inset-0 overflow-hidden pointer-events-none">
         <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-cyan-500/10 rounded-full blur-[150px] animate-pulse" />
@@ -508,10 +891,13 @@ export default function PerformanceStage() {
               {/* 中央引导线 */}
               <div className="absolute left-1/2 top-0 bottom-0 w-1 bg-gradient-to-b from-yellow-400 via-yellow-400 to-transparent" />
               
-              {/* 动作卡片流 */}
+              {/* 动作卡片流 - 精确对齐：基于视频时间计算进度 */}
               {actionHints.map((hint, index) => {
-                const elapsed = Date.now() - hint.time;
-                const progress = elapsed / 8000;
+                // 使用视频时间而非 Date.now() 计算进度
+                const video = originalVideoRef.current;
+                const currentVideoTime = video?.currentTime || 0;
+                const elapsed = Math.max(0, currentVideoTime - hint.timestamp); // 基于视频时间差
+                const progress = elapsed / 8; // 8秒动画时长
                 const x = window.innerWidth - (progress * (window.innerWidth + 200));
                 
                 return (
@@ -525,7 +911,7 @@ export default function PerformanceStage() {
                   >
                     <div className={`bg-gradient-to-r ${hint.color} rounded-2xl px-6 py-3 shadow-lg border border-white/20 flex items-center gap-3`}>
                       <span className="text-3xl">{hint.icon}</span>
-                      <span className="text-white font-bold text-lg whitespace-nowrap">{hint.text}</span>
+                      <span className="text-white font-bold text-lg whitespace-nowrap">{hint.description}</span>
                     </div>
                   </div>
                 );
@@ -569,7 +955,7 @@ export default function PerformanceStage() {
             {leftBubbles.map(bubble => (
               <div
                 key={bubble.id}
-                className="absolute left-1/2 -translate-x-1/2 rounded-full bg-gradient-to-br from-cyan-400 to-blue-400 shadow-[0_0_30px_rgba(6,182,212,0.5)]"
+                className={`absolute left-1/2 -translate-x-1/2 rounded-full bg-gradient-to-br ${bubble.color} shadow-[0_0_30px_rgba(6,182,212,0.5)]`}
                 style={{
                   top: `${bubble.y}px`,
                   width: `${bubble.size}px`,
@@ -603,7 +989,7 @@ export default function PerformanceStage() {
             {rightBubbles.map(bubble => (
               <div
                 key={bubble.id}
-                className="absolute left-1/2 -translate-x-1/2 rounded-full bg-gradient-to-br from-teal-400 to-cyan-400 shadow-[0_0_30px_rgba(20,184,166,0.5)]"
+                className={`absolute left-1/2 -translate-x-1/2 rounded-full bg-gradient-to-br ${bubble.color} shadow-[0_0_30px_rgba(20,184,166,0.5)]`}
                 style={{
                   top: `${bubble.y}px`,
                   width: `${bubble.size}px`,
@@ -617,32 +1003,88 @@ export default function PerformanceStage() {
           {/* 主舞台区域 */}
           <div className="relative z-10 flex items-center justify-center min-h-screen gap-8 px-32">
             {/* 左侧：原视频 */}
-            <div className="relative w-[400px] h-[600px] rounded-3xl overflow-hidden border-2 border-white/10 shadow-2xl">
-              <div className="absolute inset-0 bg-gradient-to-br from-slate-800 to-slate-900 flex items-center justify-center">
-                <div className="text-center">
-                  <div className="w-20 h-20 mx-auto mb-4 rounded-full bg-gradient-to-br from-cyan-400 to-blue-400 flex items-center justify-center">
-                    <i className="ri-video-line text-4xl text-white"></i>
+            <div className="relative w-[400px] h-[600px] rounded-3xl overflow-hidden border-2 border-white/10 shadow-2xl bg-black">
+              {videoAnalysisState.videoUrl ? (
+                <>
+                  <video
+                    ref={originalVideoRef}
+                    src={videoAnalysisState.videoUrl}
+                    muted
+                    playsInline
+                    autoPlay
+                    className="absolute inset-0 w-full h-full object-cover"
+                    style={{ zIndex: 1 }}
+                    onLoadedMetadata={() => {
+                      console.log('左侧视频元数据加载完成', videoAnalysisState.videoUrl);
+                      if (originalVideoRef.current) {
+                        originalVideoRef.current.play().catch(err => {
+                          console.error('左侧视频自动播放失败:', err);
+                        });
+                      }
+                    }}
+                    onPlay={() => {
+                      console.log('左侧视频开始播放');
+                    }}
+                    onError={(e) => {
+                      console.error('左侧视频加载错误:', e);
+                      console.error('视频 URL:', videoAnalysisState.videoUrl);
+                    }}
+                  />
+                  {/* 视频标签 */}
+                  <div className="absolute top-4 left-4 px-4 py-2 bg-black/40 backdrop-blur-md rounded-full border border-white/10 z-20">
+                    <span className="text-sm text-white/80 font-medium">原视频</span>
                   </div>
-                  <p className="text-white/60 text-sm">原视频播放区域</p>
-                  <p className="text-white/40 text-xs mt-2">（待接入真实视频）</p>
+                </>
+              ) : (
+                <div className="absolute inset-0 bg-gradient-to-br from-slate-800 to-slate-900 flex items-center justify-center z-0">
+                  <div className="text-center">
+                    <div className="w-20 h-20 mx-auto mb-4 rounded-full bg-gradient-to-br from-cyan-400 to-blue-400 flex items-center justify-center">
+                      <i className="ri-video-line text-4xl text-white"></i>
+                    </div>
+                    <p className="text-white/60 text-sm">原视频播放区域</p>
+                    <p className="text-white/40 text-xs mt-2">（未找到视频文件）</p>
+                    <p className="text-white/30 text-xs mt-2">videoUrl: {videoAnalysisState.videoUrl || 'null'}</p>
+                  </div>
                 </div>
-              </div>
-              
-              {/* 视频标签 */}
-              <div className="absolute top-4 left-4 px-4 py-2 bg-black/40 backdrop-blur-md rounded-full border border-white/10">
-                <span className="text-sm text-white/80 font-medium">原视频</span>
-              </div>
+              )}
             </div>
 
             {/* 右侧：用户摄像头 */}
             <div className="relative w-[400px] h-[600px] rounded-3xl overflow-hidden border-2 border-white/10 shadow-2xl">
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                className="absolute inset-0 w-full h-full object-cover scale-x-[-1]"
-              />
+              {cameraPermission === 'granted' ? (
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className="absolute inset-0 w-full h-full object-cover scale-x-[-1]"
+                  onLoadedMetadata={() => {
+                    console.log('摄像头视频元数据加载完成');
+                  }}
+                  onPlay={() => {
+                    console.log('摄像头视频开始播放');
+                  }}
+                />
+              ) : cameraPermission === 'denied' ? (
+                <div className="absolute inset-0 bg-gradient-to-br from-slate-800 to-slate-900 flex items-center justify-center">
+                  <div className="text-center px-4">
+                    <div className="w-20 h-20 mx-auto mb-4 rounded-full bg-gradient-to-br from-red-400 to-orange-400 flex items-center justify-center">
+                      <i className="ri-camera-off-line text-4xl text-white"></i>
+                    </div>
+                    <p className="text-white/60 text-sm mb-2">摄像头未授权</p>
+                    <p className="text-white/40 text-xs">{cameraError}</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="absolute inset-0 bg-gradient-to-br from-slate-800 to-slate-900 flex items-center justify-center">
+                  <div className="text-center">
+                    <div className="w-20 h-20 mx-auto mb-4 rounded-full bg-gradient-to-br from-cyan-400 to-blue-400 flex items-center justify-center animate-pulse">
+                      <i className="ri-loader-4-line text-4xl text-white animate-spin"></i>
+                    </div>
+                    <p className="text-white/60 text-sm">正在初始化摄像头...</p>
+                  </div>
+                </div>
+              )}
 
               {/* 手势检测指示 */}
               {handDetected && (

@@ -37,7 +37,6 @@ project-5201049/
 │   │   │   └── page.tsx
 │   │   ├── achievement-center/# 成就中心页 - 数据统计与徽章
 │   │   │   └── page.tsx
-│   │   ├── creator-lounge/    # 创作者休息室（待开发）
 │   │   └── NotFound.tsx        # 404 页面
 │   ├── router/                 # 路由配置
 │   │   ├── index.ts           # 路由组件封装
@@ -447,7 +446,6 @@ AI解析页 (/ai-parsing)
 
 ## 📝 待开发功能
 
-1. **创作者休息室** (`/creator-lounge`): 目录已创建但内容为空
 2. **真实视频播放**: 表演舞台页的原视频区域待接入真实视频
 3. **手势识别集成**: 当前为模拟，需要集成真实的 MediaPipe Hands
 4. **视频导出功能**: 表演完成后导出双轨视频

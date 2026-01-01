@@ -1,8 +1,10 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useVideoAnalysis } from '../../contexts/VideoAnalysisContext';
 
 export default function Home() {
   const navigate = useNavigate();
+  const { setVideoFile } = useVideoAnalysis();
   const [uploadProgress, setUploadProgress] = useState(0);
   const [isUploading, setIsUploading] = useState(false);
 
@@ -28,6 +30,9 @@ export default function Home() {
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
+      // 保存视频文件到全局状态
+      setVideoFile(file);
+      
       setIsUploading(true);
       let progress = 0;
       const interval = setInterval(() => {
