@@ -1,0 +1,139 @@
+import { useState, useEffect } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
+
+export default function AIParsing() {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [progress, setProgress] = useState(0);
+  const [currentTask, setCurrentTask] = useState(0);
+
+  const tasks = [
+    { id: 1, name: '动作语义解析', icon: 'ri-hand-heart-line' },
+    { id: 2, name: '音乐音轨分析', icon: 'ri-music-2-line' },
+    { id: 3, name: '节奏卡点识别', icon: 'ri-rhythm-line' },
+    { id: 4, name: '生成创作任务', icon: 'ri-magic-line' },
+  ];
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setProgress((prev) => {
+        if (prev >= 100) {
+          clearInterval(interval);
+          setTimeout(() => {
+            navigate('/creation-setup');
+          }, 500);
+          return 100;
+        }
+        return prev + 2;
+      });
+    }, 100);
+
+    return () => clearInterval(interval);
+  }, [navigate]);
+
+  useEffect(() => {
+    const taskIndex = Math.floor(progress / 25);
+    setCurrentTask(Math.min(taskIndex, tasks.length - 1));
+  }, [progress]);
+
+  return (
+    <div className="min-h-screen bg-black font-['Inter',sans-serif]">
+      {/* Header */}
+      <div className="px-6 pt-16 pb-12">
+        <div className="text-center">
+          <h1 className="text-4xl font-black text-white mb-3 tracking-tight">
+            AI 解析中
+          </h1>
+          <p className="text-lg text-white/50 font-medium">
+            正在分析你的视频内容
+          </p>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className="px-6 pb-20 max-w-2xl mx-auto">
+        {/* AI Brain Animation */}
+        <div className="relative mb-16">
+          <div className="relative bg-gradient-to-br from-white/8 to-white/4 backdrop-blur-2xl rounded-[32px] p-12 overflow-hidden border border-white/10">
+            {/* Soft glow effect */}
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-80 h-80 bg-purple-500/10 rounded-full blur-[100px]" />
+            
+            <div className="relative z-10 flex flex-col items-center">
+              {/* Animated circles */}
+              <div className="relative w-40 h-40 mb-8">
+                <div className="absolute inset-0 rounded-full bg-gradient-to-br from-purple-400/20 to-cyan-400/20 animate-pulse" />
+                <div className="absolute inset-4 rounded-full bg-gradient-to-br from-purple-400/30 to-cyan-400/30 animate-pulse" style={{ animationDelay: '0.5s' }} />
+                <div className="absolute inset-8 rounded-full bg-gradient-to-br from-purple-400/40 to-cyan-400/40 animate-pulse" style={{ animationDelay: '1s' }} />
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <i className="ri-brain-line text-6xl text-white/90"></i>
+                </div>
+              </div>
+
+              {/* Progress */}
+              <div className="text-6xl font-black text-white mb-4">
+                {progress}%
+              </div>
+              
+              {/* Current task */}
+              <div className="text-lg text-white/60 font-medium">
+                {tasks[currentTask].name}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Task List */}
+        <div className="space-y-4">
+          {tasks.map((task, index) => (
+            <div
+              key={task.id}
+              className={`relative bg-gradient-to-br from-white/8 to-white/4 backdrop-blur-2xl rounded-[24px] p-6 border transition-all duration-500 ${
+                index <= currentTask
+                  ? 'border-white/20 shadow-[0_0_30px_rgba(255,255,255,0.05)]'
+                  : 'border-white/5'
+              }`}
+            >
+              <div className="flex items-center gap-4">
+                {/* Icon */}
+                <div className={`w-14 h-14 rounded-full flex items-center justify-center transition-all duration-500 ${
+                  index <= currentTask
+                    ? 'bg-gradient-to-br from-purple-400/20 to-cyan-400/20 border border-white/10'
+                    : 'bg-white/5'
+                }`}>
+                  <i className={`${task.icon} text-2xl ${
+                    index <= currentTask ? 'text-white/90' : 'text-white/30'
+                  }`}></i>
+                </div>
+
+                {/* Task name */}
+                <div className="flex-1">
+                  <div className={`text-lg font-semibold transition-colors duration-500 ${
+                    index <= currentTask ? 'text-white' : 'text-white/30'
+                  }`}>
+                    {task.name}
+                  </div>
+                </div>
+
+                {/* Status */}
+                {index < currentTask && (
+                  <div className="w-8 h-8 rounded-full bg-gradient-to-br from-green-400/20 to-green-400/10 flex items-center justify-center border border-green-400/20">
+                    <i className="ri-check-line text-lg text-green-400"></i>
+                  </div>
+                )}
+                {index === currentTask && (
+                  <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-400/20 to-cyan-400/20 flex items-center justify-center border border-white/10">
+                    <i className="ri-loader-4-line text-lg text-white/90 animate-spin"></i>
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+      `}</style>
+    </div>
+  );
+}
