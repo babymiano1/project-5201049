@@ -1,20 +1,9 @@
-import { useState, useEffect } from 'react';
-import { useNavigate, useLocation } from 'react-router-dom';
-import { useVideoAnalysis } from '../../contexts/VideoAnalysisContext';
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 
 export default function CreationSetup() {
   const navigate = useNavigate();
-  const location = useLocation();
-  const { state: videoAnalysisState, setAnalysisResult } = useVideoAnalysis();
   const [selectedAvatar, setSelectedAvatar] = useState<number | null>(null);
-
-  // 接收从 AIParsing 传递过来的 action_script 数据
-  useEffect(() => {
-    if (location.state?.actionScript) {
-      // 将接收到的 action_script 保存到全局状态
-      setAnalysisResult(location.state.actionScript);
-    }
-  }, [location.state, setAnalysisResult]);
 
   const avatars = [
     { 

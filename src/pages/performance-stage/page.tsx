@@ -113,20 +113,67 @@ const DEFAULT_CONFIG = {
   bubbleColor: 'from-gray-400 to-gray-500'
 };
 
-// 将时间戳字符串转换为秒数
-function timestampToSeconds(timestamp: string): number {
-  const parts = timestamp.split(':');
+// 统一的时间戳转换函数：支持字符串（"mm:ss.ms"）和数字（秒数）
+function parseTimestampToSeconds(ts: string | number): number {
+  // 如果已经是数字，检查是否需要转换（如果大于1000，可能是毫秒）
+  if (typeof ts === 'number') {
+    // 如果数字大于1000，可能是毫秒，转换为秒
+    if (ts > 1000) {
+      console.warn('⚠️ 检测到可能为毫秒的时间戳:', ts, '，已转换为秒:', ts / 1000);
+      return ts / 1000;
+    }
+    return ts;
+  }
+  
+  // 如果是字符串，解析 "mm:ss.ms" 格式
+  const parts = ts.split(':');
   if (parts.length === 2) {
     const minutes = parseInt(parts[0], 10);
     const seconds = parseFloat(parts[1]);
-    return minutes * 60 + seconds;
+    const result = minutes * 60 + seconds;
+    return result;
   }
+  
+  // 如果格式不正确，尝试直接解析为数字
+  const parsed = parseFloat(ts);
+  if (!isNaN(parsed)) {
+    // 如果解析出的数字大于1000，可能是毫秒
+    if (parsed > 1000) {
+      console.warn('⚠️ 检测到可能为毫秒的时间戳字符串:', ts, '，已转换为秒:', parsed / 1000);
+      return parsed / 1000;
+    }
+    return parsed;
+  }
+  
+  console.warn('❌ 无法解析时间戳:', ts);
   return 0;
 }
+
+// 保持向后兼容的别名
+const timestampToSeconds = parseTimestampToSeconds;
 
 export default function PerformanceStage() {
   // 从 Context 获取分析结果
   const { state: videoAnalysisState } = useVideoAnalysis();
+  
+  // ✅ 增加数据存在性检查日志：在 render 函数顶部
+  console.log('🔍 Final Check Before Render:', {
+    analysisResultLength: videoAnalysisState.analysisResult?.length || 0,
+    analysisResult: videoAnalysisState.analysisResult,
+    videoUrl: videoAnalysisState.videoUrl ? '存在' : 'null',
+    videoFile: videoAnalysisState.videoFile ? '存在' : 'null'
+  });
+  
+  // 使用 Ref 存储脚本，避免闭包陷阱
+  const scriptRef = useRef<ActionItem[] | null>(null);
+  
+  // 同步更新 scriptRef
+  useEffect(() => {
+    scriptRef.current = videoAnalysisState.analysisResult;
+    if (videoAnalysisState.analysisResult) {
+      console.log('✅ analysisResult 已更新，共', videoAnalysisState.analysisResult.length, '个动作');
+    }
+  }, [videoAnalysisState.analysisResult]);
   
   // 调试：打印 videoUrl 状态
   useEffect(() => {
@@ -160,7 +207,9 @@ export default function PerformanceStage() {
   const animationFrameRef = useRef<number | undefined>(undefined);
   const gestureIntervalRef = useRef<number | undefined>(undefined);
   const processedActionsRef = useRef<Set<number>>(new Set<number>());
-  const timeUpdateHandlerRef = useRef<(() => void) | null>(null);
+  const syncLoopRef = useRef<number | undefined>(undefined); // requestAnimationFrame ID for sync loop
+  const processedIndicesRef = useRef<Set<number>>(new Set<number>()); // 记录已触发的动作下标
+  const lastDebugTimeRef = useRef<number>(0); // 用于每秒打印一次日志
 
   // 初始化摄像头
   useEffect(() => {
@@ -246,15 +295,17 @@ export default function PerformanceStage() {
         audioRef.current.src = '';
       }
       
-      // 停止视频播放并移除事件监听器
+      // 停止视频播放
       if (originalVideoRef.current) {
-        if (timeUpdateHandlerRef.current) {
-          originalVideoRef.current.removeEventListener('timeupdate', timeUpdateHandlerRef.current);
-          timeUpdateHandlerRef.current = null;
-        }
         originalVideoRef.current.pause();
         originalVideoRef.current.currentTime = 0;
         originalVideoRef.current.src = '';
+      }
+      
+      // 停止同步循环
+      if (syncLoopRef.current) {
+        cancelAnimationFrame(syncLoopRef.current);
+        syncLoopRef.current = undefined;
       }
       
       // 清理摄像头视频
@@ -313,11 +364,15 @@ export default function PerformanceStage() {
 
   // 开始表演
   const startPerformance = useCallback(async () => {
+    // 清理已处理的下标记录，准备新的表演
+    processedIndicesRef.current.clear();
     processedActionsRef.current.clear();
     
     // 初始化音符气泡（初始为空，后续根据动作动态生成）
     setLeftBubbles([]);
     setRightBubbles([]);
+    
+    console.log('🎭 开始表演，清理所有状态');
     
     // 同步播放音频和左侧原视频
     if (audioRef.current && videoAnalysisState.videoUrl) {
@@ -349,6 +404,27 @@ export default function PerformanceStage() {
   // 当进入 performing 阶段时启动表演
   useEffect(() => {
     if (stage === 'performing') {
+      // ✅ 重置逻辑：显式执行状态清理
+      console.log('🔄 进入 performing 阶段，执行状态重置');
+      
+      // 清空已处理动作
+      processedIndicesRef.current.clear();
+      processedActionsRef.current.clear();
+      
+      // 清空气泡数组
+      setActionHints([]);
+      setLeftBubbles([]);
+      setRightBubbles([]);
+      
+      // 重置分数和连击
+      setScore(0);
+      setCombo(0);
+      
+      // 清理粒子
+      setParticles([]);
+      
+      console.log('✅ 状态重置完成，准备开始表演');
+      
       startPerformance();
     }
   }, [stage, startPerformance]);
@@ -423,45 +499,112 @@ export default function PerformanceStage() {
     };
   }, [stage]);
 
-  // 基于视频时间轴同步动作提示（监听视频 onTimeUpdate 事件）
+  // 基于视频时间轴同步动作提示（使用 requestAnimationFrame 高频同步检查）
   useEffect(() => {
-    if (stage !== 'performing' || !videoAnalysisState.analysisResult || !originalVideoRef.current) return;
+    if (stage !== 'performing' || !originalVideoRef.current) return;
 
-    const actionScript = videoAnalysisState.analysisResult;
-    if (actionScript.length === 0) {
-      console.warn('actionScript 为空，无法生成动作提示');
-      return;
-    }
+    const video = originalVideoRef.current;
+    
+    // 使用 Ref 存储脚本，避免闭包陷阱
+    const syncLoop = () => {
+      // 从 Ref 读取最新数据
+      const actionScript = scriptRef.current;
+      if (!actionScript || actionScript.length === 0) {
+        syncLoopRef.current = requestAnimationFrame(syncLoop);
+        return;
+      }
 
-    console.log('开始监听动作脚本，共', actionScript.length, '个动作');
-
-    const handleTimeUpdate = () => {
-      const video = originalVideoRef.current;
-      if (!video || video.paused) return;
+      if (!video || video.paused) {
+        syncLoopRef.current = requestAnimationFrame(syncLoop);
+        return;
+      }
 
       const currentTime = video.currentTime;
 
-      // 遍历动作脚本，检查是否有需要显示的动作
-      actionScript.forEach((action: ActionItem) => {
-        const actionTime = timestampToSeconds(action.timestamp);
-        const timeDiff = currentTime - actionTime;
+      // 🔍 强制校对单位：检查时间单位是否一致
+      const firstAction = actionScript[0];
+      if (firstAction) {
+        const firstActionTime = parseTimestampToSeconds(firstAction.timestamp);
+        const now = Date.now();
+        if (now - lastDebugTimeRef.current >= 1000) {
+          console.log('🔍 Sync Check:', {
+            videoCurrentTime: currentTime.toFixed(3),
+            firstActionTimestamp: firstAction.timestamp,
+            firstActionTimeParsed: firstActionTime.toFixed(3),
+            timeDiff: Math.abs(currentTime - firstActionTime).toFixed(3),
+            unitCheck: currentTime < 100 && firstActionTime < 100 ? '✅ 都是秒' : '⚠️ 可能单位不一致'
+          });
+          lastDebugTimeRef.current = now;
+        }
+      }
 
-        // 在动作时间点前后 0.1 秒内触发，且未处理过
-        if (timeDiff >= -0.1 && timeDiff <= 0.1 && !processedActionsRef.current.has(action.id)) {
+      // Debug: 每秒打印一次当前视频时间
+      const now = Date.now();
+      if (now - lastDebugTimeRef.current >= 1000) {
+        console.log('🎬 syncLoop - 当前视频时间:', currentTime.toFixed(2), 's');
+        lastDebugTimeRef.current = now;
+      }
+
+      // 遍历动作脚本，检查是否有需要显示的动作
+      actionScript.forEach((action: ActionItem, index: number) => {
+        // 使用下标防止重复触发
+        if (processedIndicesRef.current.has(index)) return;
+
+        const actionTime = parseTimestampToSeconds(action.timestamp);
+
+        // ✅ 放宽触发条件：currentTime >= actionTime（已到达或超过时间点）
+        // 配合 processedIndicesRef 确保每个动作只触发一次
+        if (currentTime >= actionTime) {
+          processedIndicesRef.current.add(index);
           processedActionsRef.current.add(action.id);
 
           // 获取视觉配置
           const config = ACTION_TAG_CONFIG[action.action_tag] || DEFAULT_CONFIG;
 
-          // 添加到动作提示流（使用视频时间戳）
-          setActionHints(prev => [...prev, {
-            id: action.id,
+          // ✅ 修复 ID 冲突：使用 Date.now() + Math.random() 生成唯一 ID
+          const uniqueId = Date.now() + Math.random();
+          
+          // ✅ 确保状态累加：使用函数式更新，防止在高速循环中丢失数据
+          setActionHints(prev => {
+            // 检查是否已存在（防止重复添加，基于 action.id 而非 uniqueId）
+            const exists = prev.some(h => {
+              // 通过 action_tag 和 timestamp 判断是否为同一动作
+              return h.action_tag === action.action_tag && 
+                     Math.abs(h.timestamp - actionTime) < 0.1;
+            });
+            if (exists) {
+              console.warn('⚠️ 动作已存在，跳过:', {
+                actionId: action.id,
+                action_tag: action.action_tag,
+                timestamp: actionTime
+              });
+              return prev;
+            }
+            return [...prev, {
+              id: uniqueId, // 使用唯一 ID 防止 React 键值冲突
+              action_tag: action.action_tag,
+              description: action.description,
+              timestamp: actionTime, // 使用视频时间戳
+              color: config.color,
+              icon: config.icon
+            }];
+          });
+
+          // ✅ 增强 Debug：保留触发动作时的日志
+          console.log('✅ 触发动作:', {
+            index,
+            actionId: action.id,
+            uniqueId: uniqueId,
             action_tag: action.action_tag,
-            description: action.description,
-            timestamp: actionTime, // 使用视频时间戳
-            color: config.color,
-            icon: config.icon
-          }]);
+            timestamp: action.timestamp,
+            timestampParsed: actionTime.toFixed(3),
+            currentTime: currentTime.toFixed(3),
+            timeDiff: (currentTime - actionTime).toFixed(3),
+            config: {
+              icon: config.icon,
+              color: config.color
+            }
+          });
 
           // 如果是节奏点，生成音符气泡（数据驱动，精确卡点）
           if (action.rhythm_point) {
@@ -491,8 +634,11 @@ export default function PerformanceStage() {
               const maxSpeed = 8.0;
               const clampedSpeed = Math.max(minSpeed, Math.min(maxSpeed, speedPerFrame));
               
+              // ✅ 修复 ID 冲突：使用 Date.now() + Math.random() 生成唯一 ID
+              const bubbleUniqueId = Date.now() + Math.random();
+              
               const newBubble: NoteBubble = {
-                id: bubbleIdRef.current++,
+                id: bubbleUniqueId,
                 y: BUBBLE_START_Y,
                 speed: clampedSpeed,
                 size: 30 + action.intensity * 3,
@@ -502,10 +648,10 @@ export default function PerformanceStage() {
                 targetTime: actionTime
               };
               
-              console.log('生成音符气泡:', {
+              console.log('🎈 生成音符气泡:', {
                 action_tag: action.action_tag,
-                timeUntilRhythmPoint,
-                speed: clampedSpeed,
+                timeUntilRhythmPoint: timeUntilRhythmPoint.toFixed(2),
+                speed: clampedSpeed.toFixed(2),
                 size: newBubble.size,
                 isLeft
               });
@@ -519,20 +665,24 @@ export default function PerformanceStage() {
           }
         }
       });
+
+      // 继续循环
+      syncLoopRef.current = requestAnimationFrame(syncLoop);
     };
 
-    // 监听视频的 timeupdate 事件
-    const video = originalVideoRef.current;
-    timeUpdateHandlerRef.current = handleTimeUpdate;
-    video.addEventListener('timeupdate', handleTimeUpdate);
+    // 启动同步循环
+    console.log('🚀 启动 syncLoop，使用 requestAnimationFrame 高频同步检查');
+    syncLoopRef.current = requestAnimationFrame(syncLoop);
 
     return () => {
-      if (video && timeUpdateHandlerRef.current) {
-        video.removeEventListener('timeupdate', timeUpdateHandlerRef.current);
-        timeUpdateHandlerRef.current = null;
+      if (syncLoopRef.current) {
+        cancelAnimationFrame(syncLoopRef.current);
+        syncLoopRef.current = undefined;
       }
+      // 清理已处理的下标记录
+      processedIndicesRef.current.clear();
     };
-  }, [stage, videoAnalysisState.analysisResult]);
+  }, [stage]);
 
   // 清理过期的动作提示（基于视频时间）
   useEffect(() => {
@@ -566,7 +716,7 @@ export default function PerformanceStage() {
       const currentTime = audioRef.current?.currentTime || 0;
 
       actionScript.forEach((action: ActionItem) => {
-        const actionTime = timestampToSeconds(action.timestamp);
+        const actionTime = parseTimestampToSeconds(action.timestamp);
         const timeDiff = currentTime - actionTime;
 
         // 在动作时间点触发手势效果（数据驱动）
@@ -628,8 +778,9 @@ export default function PerformanceStage() {
       // 速度基于 intensity（1-10），映射到 2-4
       const speed = 2 + (intensity / 10) * 2;
       
+      // ✅ 修复 ID 冲突：使用 Date.now() + Math.random() 生成唯一 ID
       newParticles.push({
-        id: particleIdRef.current++,
+        id: Date.now() + Math.random() + i, // 添加 i 确保同一批次内的唯一性
         x,
         y,
         vx: Math.cos(angle) * speed,
@@ -892,30 +1043,38 @@ export default function PerformanceStage() {
               <div className="absolute left-1/2 top-0 bottom-0 w-1 bg-gradient-to-b from-yellow-400 via-yellow-400 to-transparent" />
               
               {/* 动作卡片流 - 精确对齐：基于视频时间计算进度 */}
-              {actionHints.map((hint, index) => {
-                // 使用视频时间而非 Date.now() 计算进度
-                const video = originalVideoRef.current;
-                const currentVideoTime = video?.currentTime || 0;
-                const elapsed = Math.max(0, currentVideoTime - hint.timestamp); // 基于视频时间差
-                const progress = elapsed / 8; // 8秒动画时长
-                const x = window.innerWidth - (progress * (window.innerWidth + 200));
-                
-                return (
-                  <div
-                    key={hint.id}
-                    className="absolute top-1/2 -translate-y-1/2"
-                    style={{
-                      left: `${x}px`,
-                      opacity: progress > 0.8 ? (1 - (progress - 0.8) / 0.2) : 1
-                    }}
-                  >
-                    <div className={`bg-gradient-to-r ${hint.color} rounded-2xl px-6 py-3 shadow-lg border border-white/20 flex items-center gap-3`}>
-                      <span className="text-3xl">{hint.icon}</span>
-                      <span className="text-white font-bold text-lg whitespace-nowrap">{hint.description}</span>
-                    </div>
-                  </div>
-                );
-              })}
+              {actionHints.length > 0 && (
+                <div className="absolute inset-0" style={{ zIndex: 100 }}>
+                  {actionHints.map((hint, index) => {
+                    // 使用视频时间而非 Date.now() 计算进度
+                    const video = originalVideoRef.current;
+                    const currentVideoTime = video?.currentTime || 0;
+                    const elapsed = Math.max(0, currentVideoTime - hint.timestamp); // 基于视频时间差
+                    // ✅ 检查动画时长：确保分母至少为2秒以上（当前为8秒，满足要求）
+                    const ANIMATION_DURATION = 8; // 8秒动画时长
+                    const progress = elapsed / ANIMATION_DURATION;
+                    const x = window.innerWidth - (progress * (window.innerWidth + 200));
+                    const opacity = progress > 0.8 ? (1 - (progress - 0.8) / 0.2) : 1;
+                    
+                    return (
+                      <div
+                        key={hint.id}
+                        className="absolute top-1/2 -translate-y-1/2"
+                        style={{
+                          left: `${x}px`,
+                          opacity: opacity,
+                          zIndex: 1
+                        }}
+                      >
+                        <div className={`bg-gradient-to-r ${hint.color} rounded-2xl px-6 py-3 shadow-lg border border-white/20 flex items-center gap-3`}>
+                          <span className="text-3xl">{hint.icon}</span>
+                          <span className="text-white font-bold text-lg whitespace-nowrap">{hint.description}</span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
 
@@ -1012,21 +1171,23 @@ export default function PerformanceStage() {
                     muted
                     playsInline
                     autoPlay
+                    crossOrigin="anonymous"
                     className="absolute inset-0 w-full h-full object-cover"
                     style={{ zIndex: 1 }}
                     onLoadedMetadata={() => {
-                      console.log('左侧视频元数据加载完成', videoAnalysisState.videoUrl);
+                      console.log('✅ 左侧视频元数据加载完成', videoAnalysisState.videoUrl);
                       if (originalVideoRef.current) {
+                        console.log('🎬 originalVideoRef 已赋值，准备播放');
                         originalVideoRef.current.play().catch(err => {
-                          console.error('左侧视频自动播放失败:', err);
+                          console.error('❌ 左侧视频自动播放失败:', err);
                         });
                       }
                     }}
                     onPlay={() => {
-                      console.log('左侧视频开始播放');
+                      console.log('▶️ 左侧视频开始播放');
                     }}
                     onError={(e) => {
-                      console.error('左侧视频加载错误:', e);
+                      console.error('❌ 左侧视频加载错误:', e);
                       console.error('视频 URL:', videoAnalysisState.videoUrl);
                     }}
                   />

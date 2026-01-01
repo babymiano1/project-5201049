@@ -73,19 +73,12 @@ export default function AIParsing() {
     }
   }, [progress, state.videoFile, location.state, navigate, analyzeVideo]);
 
+  // 进度条更新逻辑
   useEffect(() => {
     const interval = setInterval(() => {
       setProgress((prev) => {
         if (prev >= 100) {
           clearInterval(interval);
-          setTimeout(() => {
-            // 跳转到创作设置页，并通过 state 携带 action_script 数据
-            navigate('/creation-setup', {
-              state: {
-                actionScript: state.analysisResult || null
-              }
-            });
-          }, 500);
           return 100;
         }
         return prev + 2;
@@ -93,7 +86,24 @@ export default function AIParsing() {
     }, 100);
 
     return () => clearInterval(interval);
-  }, [navigate, state.analysisResult]);
+  }, []);
+
+  // ✅ 写入确认：只有当 state.analysisResult 确实不为 null 时，才执行跳转
+  useEffect(() => {
+    // 只有当进度达到 100% 且分析结果确实存在时才跳转
+    if (progress >= 100 && state.analysisResult && state.analysisResult.length > 0) {
+      console.log('✅ 数据写入确认，准备跳转，动作数量:', state.analysisResult.length);
+      setTimeout(() => {
+        navigate('/creation-setup', {
+          state: {
+            actionScript: state.analysisResult
+          }
+        });
+      }, 500);
+    } else if (progress >= 100 && !state.analysisResult) {
+      console.warn('⚠️ 进度已完成但分析结果为空，等待数据写入...');
+    }
+  }, [progress, state.analysisResult, navigate]);
 
   useEffect(() => {
     const taskIndex = Math.floor(progress / 25);
