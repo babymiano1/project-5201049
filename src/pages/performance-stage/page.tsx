@@ -15,6 +15,8 @@ interface Particle {
   maxLife: number;
   color: string;
   size: number;
+  type?: 'normal' | 'firework' | 'explosion' | 'rainbow' | 'star' | 'sparkle'; // ✅ 特效类型
+  trail?: boolean; // ✅ 是否带拖尾效果
 }
 
 // 动作提示类型
@@ -85,6 +87,11 @@ const ACTION_TAG_CONFIG: Record<string, { icon: string; color: string; bubbleCol
     icon: '❤️',
     color: 'from-pink-400 to-rose-400',
     bubbleColor: 'from-pink-400 to-rose-400'
+  },
+  'HIT': {
+    icon: '💥',
+    color: 'from-yellow-400 to-orange-400',
+    bubbleColor: 'from-yellow-400 to-orange-400'
   },
   'FRAME': {
     icon: '🖼️',
@@ -191,10 +198,13 @@ export default function PerformanceStage() {
   const [cameraError, setCameraError] = useState<string>('');
   const [score, setScore] = useState(0);
   const [combo, setCombo] = useState(0);
-  const [particles, setParticles] = useState<Particle[]>([]);
+  // ✅ 性能优化：将粒子和气泡数据迁移到 useRef，避免频繁的 React 重渲染
+  const particlesRef = useRef<Particle[]>([]);
+  const leftBubblesRef = useRef<NoteBubble[]>([]);
+  const rightBubblesRef = useRef<NoteBubble[]>([]);
+  
+  // 保留 actionHints 使用 useState（因为需要触发 React 渲染来显示 UI）
   const [actionHints, setActionHints] = useState<ActionHint[]>([]);
-  const [leftBubbles, setLeftBubbles] = useState<NoteBubble[]>([]);
-  const [rightBubbles, setRightBubbles] = useState<NoteBubble[]>([]);
   const [handDetected, setHandDetected] = useState(false);
   const [lastGestureTime, setLastGestureTime] = useState(0);
 
@@ -213,7 +223,6 @@ export default function PerformanceStage() {
   const particleIdRef = useRef(0);
   const actionIdRef = useRef(0);
   const bubbleIdRef = useRef(0);
-  const animationFrameRef = useRef<number | undefined>(undefined);
   const gestureIntervalRef = useRef<number | undefined>(undefined);
   const processedActionsRef = useRef<Set<number>>(new Set<number>());
   const syncLoopRef = useRef<number | undefined>(undefined); // requestAnimationFrame ID for sync loop
@@ -222,6 +231,7 @@ export default function PerformanceStage() {
 
   // new refs
   const canvasRef = useRef<HTMLCanvasElement>(null); // 用于绘制骨骼
+  const effectsCanvasRef = useRef<HTMLCanvasElement>(null); // ✅ 新增：用于绘制粒子和气泡的 Canvas
   const handsRef = useRef<Hands | null>(null);       // MediaPipe 实例
   const cameraRef = useRef<Camera | null>(null);     // MediaPipe Camera 工具
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -229,8 +239,12 @@ export default function PerformanceStage() {
   const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const scoreRef = useRef<number>(0); // ✅ 用于保存最新分数，确保冻结时获取最新值
   const comboRef = useRef<number>(0); // ✅ 用于保存最新连击，确保冻结时获取最新值
+  
+  // ✅ 性能优化：统一的动画循环 ref
+  const mainAnimationFrameRef = useRef<number | undefined>(undefined);
+  const lastHandsProcessTimeRef = useRef<number>(0); // ✅ 用于手势识别节流（30fps = 33ms）
 
-  // ✅ 绘制手部骨骼（提取为独立函数）
+  // ✅ 绘制手部骨骼（优化：移除 shadowBlur 等高能耗属性）
   const drawHandSkeleton = useCallback((
     ctx: CanvasRenderingContext2D,
     landmarks: any[],
@@ -246,10 +260,10 @@ export default function PerformanceStage() {
       [5, 9], [9, 13], [13, 17]
     ];
 
+    // ✅ 性能优化：移除 shadowBlur，使用更高效的绘制方式
     ctx.strokeStyle = '#06b6d4';
     ctx.lineWidth = 3;
-    ctx.shadowBlur = 10;
-    ctx.shadowColor = '#06b6d4';
+    // 移除 shadowBlur 和 shadowColor，改用更简单的绘制
 
     connections.forEach(([start, end]) => {
       const startPoint = landmarks[start];
@@ -262,21 +276,17 @@ export default function PerformanceStage() {
     });
 
     ctx.fillStyle = '#14b8a6';
-    ctx.shadowBlur = 15;
-    ctx.shadowColor = '#14b8a6';
+    // 移除 shadowBlur
 
     landmarks.forEach((landmark) => {
       ctx.beginPath();
       ctx.arc(landmark.x * width, landmark.y * height, 5, 0, 2 * Math.PI);
       ctx.fill();
     });
-
-    ctx.shadowBlur = 0;
   }, []);
 
-  // ✅ 创建粒子（基于 action_tag 和 intensity，数据驱动）- 提前定义以便其他函数使用
-  const createParticles = useCallback((x: number, y: number, colorGradient: string, intensity: number) => {
-    // 从渐变色字符串中提取主要颜色（简化处理）
+  // ✅ 颜色映射工具函数（提前定义）
+  const getColorFromGradient = useCallback((colorGradient: string): string => {
     const colorMap: Record<string, string> = {
       'from-blue-400 to-cyan-400': '#06b6d4',
       'from-purple-400 to-pink-400': '#8b5cf6',
@@ -288,17 +298,207 @@ export default function PerformanceStage() {
       'from-teal-400 to-cyan-400': '#14b8a6',
       'from-gray-400 to-gray-500': '#9ca3af',
     };
+    return colorMap[colorGradient] || '#8b5cf6';
+  }, []);
+
+  // ✅ 性能优化：统一的 Canvas 绘制函数（绘制粒子和气泡）
+  const drawEffects = useCallback(() => {
+    if (!effectsCanvasRef.current) return;
     
-    const particleColor = colorMap[colorGradient] || '#8b5cf6';
-    const particleCount = 15 + Math.floor(intensity / 2); // 基于 intensity 决定粒子数量
+    const canvas = effectsCanvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    
+    // 设置 Canvas 尺寸
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    
+    // 清空画布
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    const JUDGE_LINE_Y = window.innerHeight * 0.2;
+    const deltaTime = 1 / 60; // 固定帧率 60fps
+    
+    // ✅ 更新并绘制左侧气泡
+    leftBubblesRef.current = leftBubblesRef.current
+      .map(bubble => {
+        const audioTime = audioRef.current?.currentTime || 0;
+        
+        // 如果有目标时间，进行精确同步检查
+        if (bubble.targetTime !== undefined) {
+          const timeDiff = audioTime - bubble.targetTime;
+          if (timeDiff > 0.2 && bubble.y > JUDGE_LINE_Y + 50) {
+            return null;
+          }
+        }
+        
+        let newY = bubble.y + bubble.speed * (deltaTime * 60);
+        if (newY > window.innerHeight + 100) {
+          return null;
+        }
+        
+        // 绘制气泡
+        const gradient = ctx.createRadialGradient(
+          window.innerWidth * 0.08, newY,
+          0,
+          window.innerWidth * 0.08, newY,
+          bubble.size / 2
+        );
+        const color = getColorFromGradient(bubble.color);
+        gradient.addColorStop(0, color);
+        // 创建透明边缘：将 hex 颜色转换为 rgba
+        const r = parseInt(color.slice(1, 3), 16);
+        const g = parseInt(color.slice(3, 5), 16);
+        const b = parseInt(color.slice(5, 7), 16);
+        gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+        
+        ctx.fillStyle = gradient;
+        ctx.globalAlpha = bubble.opacity;
+        ctx.beginPath();
+        ctx.arc(window.innerWidth * 0.08, newY, bubble.size / 2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        
+        return { ...bubble, y: newY };
+      })
+      .filter((bubble): bubble is NoteBubble => bubble !== null);
+    
+    // ✅ 更新并绘制右侧气泡
+    rightBubblesRef.current = rightBubblesRef.current
+      .map(bubble => {
+        const audioTime = audioRef.current?.currentTime || 0;
+        
+        // 如果有目标时间，进行精确同步检查
+        if (bubble.targetTime !== undefined) {
+          const timeDiff = audioTime - bubble.targetTime;
+          if (timeDiff > 0.2 && bubble.y > JUDGE_LINE_Y + 50) {
+            return null;
+          }
+        }
+        
+        let newY = bubble.y + bubble.speed * (deltaTime * 60);
+        if (newY > window.innerHeight + 100) {
+          return null;
+        }
+        
+        // 绘制气泡
+        const gradient = ctx.createRadialGradient(
+          window.innerWidth * 0.92, newY,
+          0,
+          window.innerWidth * 0.92, newY,
+          bubble.size / 2
+        );
+        const color = getColorFromGradient(bubble.color);
+        gradient.addColorStop(0, color);
+        // 创建透明边缘：将 hex 颜色转换为 rgba
+        const r = parseInt(color.slice(1, 3), 16);
+        const g = parseInt(color.slice(3, 5), 16);
+        const b = parseInt(color.slice(5, 7), 16);
+        gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
+        
+        ctx.fillStyle = gradient;
+        ctx.globalAlpha = bubble.opacity;
+        ctx.beginPath();
+        ctx.arc(window.innerWidth * 0.92, newY, bubble.size / 2, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        
+        return { ...bubble, y: newY };
+      })
+      .filter((bubble): bubble is NoteBubble => bubble !== null);
+    
+    // ✅ 更新并绘制粒子
+    particlesRef.current = particlesRef.current
+      .map(p => {
+        let newVx = p.vx;
+        let newVy = p.vy;
+        
+        // 根据特效类型应用不同的物理效果
+        switch (p.type) {
+          case 'firework':
+            newVy = p.vy + 0.15;
+            newVx = p.vx * 0.98;
+            break;
+          case 'explosion':
+            newVy = p.vy + 0.08;
+            newVx = p.vx * 0.97;
+            break;
+          case 'rainbow':
+            newVy = p.vy + 0.05;
+            newVx = p.vx * 0.99;
+            break;
+          case 'star':
+            newVy = p.vy + 0.03;
+            newVx = p.vx * 0.995;
+            break;
+          case 'sparkle':
+            newVy = p.vy + 0.1;
+            newVx = p.vx * 0.95;
+            break;
+          default:
+            newVy = p.vy + 0.1;
+            break;
+        }
+        
+        const newX = p.x + newVx;
+        const newY = p.y + newVy;
+        const lifeProgress = p.life / p.maxLife;
+        const opacity = 1 - lifeProgress;
+        
+        // 绘制粒子
+        ctx.globalAlpha = opacity;
+        ctx.fillStyle = p.color;
+        
+        switch (p.type) {
+          case 'star':
+            // 绘制星形
+            const starSize = p.size;
+            ctx.save();
+            ctx.translate(newX, newY);
+            ctx.beginPath();
+            for (let i = 0; i < 5; i++) {
+              const angle = (i * 4 * Math.PI) / 5 - Math.PI / 2;
+              const x = Math.cos(angle) * starSize;
+              const y = Math.sin(angle) * starSize;
+              if (i === 0) ctx.moveTo(x, y);
+              else ctx.lineTo(x, y);
+            }
+            ctx.closePath();
+            ctx.fill();
+            ctx.restore();
+            break;
+          default:
+            // 绘制圆形粒子
+            ctx.beginPath();
+            ctx.arc(newX, newY, p.size / 2, 0, Math.PI * 2);
+            ctx.fill();
+            break;
+        }
+        
+        ctx.globalAlpha = 1;
+        
+        return {
+          ...p,
+          x: newX,
+          y: newY,
+          vx: newVx,
+          vy: newVy,
+          life: p.life + 1
+        };
+      })
+      .filter(p => p.life < p.maxLife);
+  }, [getColorFromGradient]);
+
+  // ✅ 创建基础粒子特效
+  const createParticles = useCallback((x: number, y: number, colorGradient: string, intensity: number) => {
+    const particleColor = getColorFromGradient(colorGradient);
+    const particleCount = 15 + Math.floor(intensity / 2);
     const newParticles: Particle[] = [];
 
     for (let i = 0; i < particleCount; i++) {
       const angle = (Math.PI * 2 * i) / particleCount;
-      // 速度基于 intensity（1-10），映射到 2-4
       const speed = 2 + (intensity / 10) * 2;
       
-      // ✅ 修复 ID 冲突：使用 Date.now() + Math.random() 生成唯一 ID
       newParticles.push({
         id: Date.now() + Math.random() + i,
         x,
@@ -308,17 +508,181 @@ export default function PerformanceStage() {
         life: 1.0,
         maxLife: 1.0,
         color: particleColor,
-        size: 3 + Math.random() * 3
+        size: 3 + Math.random() * 3,
+        type: 'normal'
       });
     }
 
-    setParticles(prev => [...prev, ...newParticles]);
+    // ✅ 性能优化：直接更新 ref，不触发 React 重渲染
+    particlesRef.current = [...particlesRef.current, ...newParticles];
+  }, [getColorFromGradient]);
+
+  // ✅ 创建烟花特效（多层爆炸效果）
+  const createFireworks = useCallback((x: number, y: number, intensity: number) => {
+    const colors = ['#ff6b6b', '#4ecdc4', '#ffe66d', '#ff8c94', '#95e1d3', '#f38181'];
+    const newParticles: Particle[] = [];
+    const layerCount = 2 + Math.floor(intensity / 3); // 2-4层
+    
+    for (let layer = 0; layer < layerCount; layer++) {
+      const layerDelay = layer * 5; // 每层延迟
+      const layerRadius = 30 + layer * 20;
+      const particleCount = 30 + layer * 10;
+      const color = colors[layer % colors.length];
+      
+      for (let i = 0; i < particleCount; i++) {
+        const angle = (Math.PI * 2 * i) / particleCount + (Math.random() - 0.5) * 0.3;
+        const speed = 3 + layer * 1.5 + Math.random() * 2;
+        const baseVx = Math.cos(angle) * speed;
+        const baseVy = Math.sin(angle) * speed;
+        
+        newParticles.push({
+          id: Date.now() + Math.random() + i + layer * 1000,
+          x: x + Math.cos(angle) * layerRadius * 0.3,
+          y: y + Math.sin(angle) * layerRadius * 0.3,
+          vx: baseVx,
+          vy: baseVy,
+          life: layerDelay,
+          maxLife: 80 + layer * 20,
+          color,
+          size: 4 + Math.random() * 4,
+          type: 'firework',
+          trail: true
+        });
+      }
+    }
+
+    // ✅ 性能优化：直接更新 ref
+    particlesRef.current = [...particlesRef.current, ...newParticles];
+  }, []);
+
+  // ✅ 创建爆炸特效（快速扩散）- 优化性能
+  const createExplosion = useCallback((x: number, y: number, intensity: number) => {
+    const colors = ['#ff4757', '#ff6348', '#ffa502', '#ffd32a', '#ff6b81'];
+    const newParticles: Particle[] = [];
+    // ✅ 优化：限制粒子数量，保证流畅度
+    const particleCount = Math.min(30 + Math.floor(intensity * 2), 60);
+    
+    for (let i = 0; i < particleCount; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 4 + Math.random() * 6;
+      const color = colors[Math.floor(Math.random() * colors.length)];
+      
+      newParticles.push({
+        id: Date.now() + Math.random() + i,
+        x,
+        y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 1,
+        maxLife: 50 + Math.random() * 30,
+        color,
+        size: 5 + Math.random() * 6,
+        type: 'explosion',
+        trail: true
+      });
+    }
+
+    // ✅ 性能优化：直接更新 ref
+    particlesRef.current = [...particlesRef.current, ...newParticles];
+  }, []);
+
+  // ✅ 创建彩虹特效（弧形粒子流）- 优化性能
+  const createRainbow = useCallback((x: number, y: number, intensity: number) => {
+    const rainbowColors = ['#ff0000', '#ff7f00', '#ffff00', '#00ff00', '#0000ff', '#4b0082', '#9400d3'];
+    const newParticles: Particle[] = [];
+    // ✅ 优化：减少粒子数量
+    const particleCount = Math.min(30 + Math.floor(intensity * 1.5), 50);
+    
+    for (let i = 0; i < particleCount; i++) {
+      const progress = i / particleCount;
+      const angle = -Math.PI / 2 + (progress - 0.5) * Math.PI; // 弧形
+      const speed = 2 + Math.random() * 3;
+      const color = rainbowColors[Math.floor(progress * rainbowColors.length)];
+      
+      newParticles.push({
+        id: Date.now() + Math.random() + i,
+        x: x + Math.cos(angle) * 50,
+        y: y + Math.sin(angle) * 50,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed + 1, // 向下飘落
+        life: 1,
+        maxLife: 60 + Math.random() * 40,
+        color,
+        size: 3 + Math.random() * 4,
+        type: 'rainbow'
+      });
+    }
+
+    // ✅ 性能优化：直接更新 ref
+    particlesRef.current = [...particlesRef.current, ...newParticles];
+  }, []);
+
+  // ✅ 创建星星特效（闪烁星星）- 优化性能
+  const createStars = useCallback((x: number, y: number, intensity: number) => {
+    const colors = ['#ffffff', '#ffd700', '#87ceeb', '#ff69b4', '#98fb98'];
+    const newParticles: Particle[] = [];
+    // ✅ 优化：减少粒子数量
+    const particleCount = Math.min(15 + Math.floor(intensity * 1.5), 30);
+    
+    for (let i = 0; i < particleCount; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const distance = 20 + Math.random() * 60;
+      const speed = 0.5 + Math.random() * 1.5;
+      const color = colors[Math.floor(Math.random() * colors.length)];
+      
+      newParticles.push({
+        id: Date.now() + Math.random() + i,
+        x: x + Math.cos(angle) * distance,
+        y: y + Math.sin(angle) * distance,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 1,
+        maxLife: 100 + Math.random() * 50,
+        color,
+        size: 2 + Math.random() * 4,
+        type: 'star'
+      });
+    }
+
+    // ✅ 性能优化：直接更新 ref
+    particlesRef.current = [...particlesRef.current, ...newParticles];
+  }, []);
+
+  // ✅ 创建闪光特效（快速闪烁）- 优化性能
+  const createSparkles = useCallback((x: number, y: number, intensity: number) => {
+    const colors = ['#ffffff', '#ffff00', '#00ffff', '#ff00ff'];
+    const newParticles: Particle[] = [];
+    // ✅ 优化：减少粒子数量
+    const particleCount = Math.min(20 + Math.floor(intensity * 1.5), 35);
+    
+    for (let i = 0; i < particleCount; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 3 + Math.random() * 4;
+      const color = colors[Math.floor(Math.random() * colors.length)];
+      
+      newParticles.push({
+        id: Date.now() + Math.random() + i,
+        x,
+        y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 1,
+        maxLife: 30 + Math.random() * 20,
+        color,
+        size: 2 + Math.random() * 3,
+        type: 'sparkle'
+      });
+    }
+
+    // ✅ 性能优化：直接更新 ref
+    particlesRef.current = [...particlesRef.current, ...newParticles];
   }, []);
 
   // ✅ 触发手势效果（基于 action 数据）- 提前定义以便其他函数使用
   const triggerGesture = useCallback((action: ActionItem) => {
     const now = Date.now();
-    if (now - lastGestureTime < 300) return; // 防止过于频繁
+    // ✅ 降低防抖时间：从300ms降到100ms，让特效更容易触发
+    if (now - lastGestureTime < 100) return;
     
     setLastGestureTime(now);
     setHandDetected(true);
@@ -326,45 +690,127 @@ export default function PerformanceStage() {
 
     // 根据 intensity 计算分数（数据驱动）
     const baseScore = 50 + action.intensity * 10;
-    setScore(prev => {
-      const newScore = prev + baseScore;
-      scoreRef.current = newScore; // ✅ 同步更新 ref
-      return newScore;
-    });
+    scoreRef.current += baseScore;
+    setScore(scoreRef.current); // ✅ 更新状态以触发 UI 更新
     
     // 如果是节奏点，增加连击
     if (action.rhythm_point) {
-      setCombo(prev => {
-        const newCombo = prev + 1;
-        comboRef.current = newCombo; // ✅ 同步更新 ref
-        return newCombo;
-      });
+      comboRef.current += 1;
+      setCombo(comboRef.current); // ✅ 更新状态以触发 UI 更新
     }
 
-    // 生成粒子（基于 action_tag 的颜色）
+    // ✅ 根据不同的 action_tag 触发不同的炫酷特效
     const config = ACTION_TAG_CONFIG[action.action_tag] || {
       icon: '✨',
       color: 'from-purple-400 to-pink-400',
       bubbleColor: 'from-purple-400 to-pink-400'
     };
-    createParticles(200, 300, config.color, action.intensity);
-  }, [createParticles]);
+    
+    // 根据手势类型选择特效位置（使用屏幕中心或手势位置）
+    const effectX = window.innerWidth / 2;
+    const effectY = window.innerHeight / 2;
+    
+    // ✅ 根据不同的 action_tag 触发不同的特效
+    switch (action.action_tag) {
+      case 'PUNCH':
+      case 'HIT':
+        // 拳击/击中：爆炸特效
+        createExplosion(effectX, effectY, action.intensity);
+        break;
+      case 'CLAP':
+        // 拍手：烟花特效
+        createFireworks(effectX, effectY, action.intensity);
+        break;
+      case 'HEART':
+        // 比心：星星特效
+        createStars(effectX, effectY, action.intensity);
+        break;
+      case 'WAVE':
+      case 'SWIPE':
+        // 挥手/滑动：彩虹特效
+        createRainbow(effectX, effectY, action.intensity);
+        break;
+      case 'SPIN':
+      case 'CIRCLE':
+        // 旋转/画圈：闪光特效
+        createSparkles(effectX, effectY, action.intensity);
+        break;
+      default:
+        // 默认：基础粒子特效
+        createParticles(effectX, effectY, config.color, action.intensity);
+        break;
+    }
+  }, [createParticles, createFireworks, createExplosion, createRainbow, createStars, createSparkles]);
+
+  // ✅ 简单手势识别函数（检测握拳、张开等）
+  const detectSimpleGesture = useCallback((landmarks: any[]): string | null => {
+    if (!landmarks || landmarks.length < 21) return null;
+    
+    // 获取关键点
+    const indexTip = landmarks[8];    // 食指指尖
+    const indexPip = landmarks[6];     // 食指第二关节
+    const middleTip = landmarks[12];   // 中指指尖
+    const middlePip = landmarks[10];   // 中指第二关节
+    const ringTip = landmarks[16];    // 无名指指尖
+    const ringPip = landmarks[14];    // 无名指第二关节
+    const pinkyTip = landmarks[20];   // 小指指尖
+    const pinkyPip = landmarks[18];    // 小指第二关节
+    const thumbTip = landmarks[4];    // 拇指指尖
+    const thumbIp = landmarks[3];      // 拇指第一关节
+    
+    // ✅ 握拳检测：所有手指都弯曲（指尖y坐标大于关节y坐标）
+    const fingersBent = [
+      indexTip.y > indexPip.y,
+      middleTip.y > middlePip.y,
+      ringTip.y > ringPip.y,
+      pinkyTip.y > pinkyPip.y
+    ];
+    const bentCount = fingersBent.filter(Boolean).length;
+    
+    // ✅ 张开检测：至少3个手指展开
+    const fingersExtended = [
+      indexTip.y < indexPip.y,
+      middleTip.y < middlePip.y,
+      ringTip.y < ringPip.y,
+      pinkyTip.y < pinkyPip.y
+    ];
+    const extendedCount = fingersExtended.filter(Boolean).length;
+    
+    // ✅ 比心检测：拇指和食指靠近
+    const thumbIndexDistance = Math.sqrt(
+      Math.pow(thumbTip.x - indexTip.x, 2) + 
+      Math.pow(thumbTip.y - indexTip.y, 2)
+    );
+    
+    if (bentCount >= 3) {
+      return 'PUNCH'; // 握拳
+    } else if (extendedCount >= 3) {
+      return 'WAVE'; // 张开/挥手
+    } else if (thumbIndexDistance < 0.05 && extendedCount >= 2) {
+      return 'HEART'; // 比心
+    }
+    
+    return null;
+  }, []);
 
   // ✅ 碰撞检测逻辑（使用 useCallback 优化）
   const checkBubbleCollision = useCallback((handX: number, handY: number) => {
     if (!canvasRef.current) return;
     
-    const hitRadius = 50; // 判定范围
+    // ✅ 扩大判定范围：从50px增加到80px，更容易触发
+    const hitRadius = 80;
     const canvasWidth = canvasRef.current.width;
     const JUDGE_LINE_Y = window.innerHeight * 0.2;
     
+    // ✅ 性能优化：直接操作 ref，不触发 React 重渲染
     // 检查左侧气泡
-    setLeftBubbles(prev => prev.filter(bubble => {
+    leftBubblesRef.current = leftBubblesRef.current.filter(bubble => {
       // 计算气泡在 Canvas 坐标系中的 Y 位置（需要考虑气泡的 y 是相对于窗口的）
       const bubbleCanvasY = (bubble.y / window.innerHeight) * canvasRef.current!.height;
+      // ✅ 放宽判定条件：扩大判定窗口
       const isHit = Math.abs(handY - bubbleCanvasY) < hitRadius && 
                     handX < canvasWidth / 2 &&
-                    Math.abs(bubble.y - JUDGE_LINE_Y) < 50; // 气泡接近判定线
+                    Math.abs(bubble.y - JUDGE_LINE_Y) < 100; // ✅ 扩大判定窗口：从50px到100px
       
       if (isHit) {
         // 触发得分和特效
@@ -380,14 +826,15 @@ export default function PerformanceStage() {
         return false; // 移除气泡
       }
       return true;
-    }));
+    });
     
     // 检查右侧气泡
-    setRightBubbles(prev => prev.filter(bubble => {
+    rightBubblesRef.current = rightBubblesRef.current.filter(bubble => {
       const bubbleCanvasY = (bubble.y / window.innerHeight) * canvasRef.current!.height;
+      // ✅ 放宽判定条件：扩大判定窗口
       const isHit = Math.abs(handY - bubbleCanvasY) < hitRadius && 
                     handX >= canvasWidth / 2 &&
-                    Math.abs(bubble.y - JUDGE_LINE_Y) < 50; // 气泡接近判定线
+                    Math.abs(bubble.y - JUDGE_LINE_Y) < 100; // ✅ 扩大判定窗口：从50px到100px
       
       if (isHit) {
         const hitAction: ActionItem = { 
@@ -402,12 +849,19 @@ export default function PerformanceStage() {
         return false; // 移除气泡
       }
       return true;
-    }));
+    });
   }, [triggerGesture]);
 
-  // ✅ 处理识别结果并绘制（使用 useCallback 优化）
+  // ✅ 处理识别结果并绘制（添加 30fps 节流处理）
   const onHandsResults = useCallback((results: Results) => {
     if (!canvasRef.current) return;
+    
+    // ✅ 性能优化：30fps 节流（33ms间隔）
+    const now = Date.now();
+    if (now - lastHandsProcessTimeRef.current < 33) {
+      return; // 跳过本次处理
+    }
+    lastHandsProcessTimeRef.current = now;
     
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
@@ -428,13 +882,31 @@ export default function PerformanceStage() {
         const x = indexTip.x * canvas.width;
         const y = indexTip.y * canvas.height;
 
-        // 检测碰撞：判断手是否碰到了气泡
-        checkBubbleCollision(x, y); 
+        // ✅ 检测碰撞：判断手是否碰到了气泡
+        checkBubbleCollision(x, y);
+        
+        // ✅ 新增：直接基于手势识别触发特效（不依赖气泡碰撞）
+        const detectedGesture = detectSimpleGesture(landmarks);
+        if (detectedGesture) {
+          // ✅ 降低防抖：允许更频繁触发（150ms间隔）
+          if (now - lastGestureTime >= 150) {
+            // 创建临时 ActionItem 来触发特效
+            const tempAction: ActionItem = {
+              id: Date.now(),
+              action_tag: detectedGesture,
+              description: `检测到${detectedGesture}手势`,
+              intensity: 5, // 中等强度
+              timestamp: '0:00.0',
+              rhythm_point: false
+            };
+            triggerGesture(tempAction);
+          }
+        }
       });
     } else {
       setHandDetected(false);
     }
-  }, [drawHandSkeleton, checkBubbleCollision]);
+  }, [drawHandSkeleton, checkBubbleCollision, detectSimpleGesture, triggerGesture]);
 
   // ✅ 初始化手势跟踪（使用 useCallback 优化）
   const initHandTracking = useCallback(() => {
@@ -553,16 +1025,25 @@ export default function PerformanceStage() {
         streamRef.current = null;
       }
       
-      // 取消动画帧
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
-        animationFrameRef.current = undefined;
+      // ✅ 清理所有动画循环和定时器
+      if (mainAnimationFrameRef.current) {
+        cancelAnimationFrame(mainAnimationFrameRef.current);
+        mainAnimationFrameRef.current = undefined;
       }
       
-      // 清除定时器
+      if (syncLoopRef.current) {
+        cancelAnimationFrame(syncLoopRef.current);
+        syncLoopRef.current = undefined;
+      }
+      
       if (gestureIntervalRef.current) {
         clearInterval(gestureIntervalRef.current);
         gestureIntervalRef.current = undefined;
+      }
+      
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+        recordingTimerRef.current = null;
       }
       
       // 停止音频播放
@@ -579,10 +1060,32 @@ export default function PerformanceStage() {
         originalVideoRef.current.src = '';
       }
       
-      // 停止同步循环
-      if (syncLoopRef.current) {
-        cancelAnimationFrame(syncLoopRef.current);
-        syncLoopRef.current = undefined;
+      // ✅ 停止 MediaPipe 资源
+      if (cameraRef.current) {
+        try {
+          cameraRef.current.stop();
+          cameraRef.current = null;
+        } catch (error) {
+          console.warn('⚠️ 停止 MediaPipe Camera 失败:', error);
+        }
+      }
+      
+      if (handsRef.current) {
+        try {
+          handsRef.current.close();
+          handsRef.current = null;
+        } catch (error) {
+          console.warn('⚠️ 关闭 MediaPipe Hands 失败:', error);
+        }
+      }
+      
+      // ✅ 停止录制
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        try {
+          mediaRecorderRef.current.stop();
+        } catch (error) {
+          console.warn('⚠️ 停止录制失败:', error);
+        }
       }
       
       // 清理摄像头视频
@@ -591,12 +1094,18 @@ export default function PerformanceStage() {
         videoRef.current.srcObject = null;
       }
       
-      // 清理状态
-      setParticles([]);
+      // ✅ 性能优化：清理 ref 数据
+      particlesRef.current = [];
+      leftBubblesRef.current = [];
+      rightBubblesRef.current = [];
       setActionHints([]);
-      setLeftBubbles([]);
-      setRightBubbles([]);
       processedActionsRef.current.clear();
+      
+      // ✅ 清理统一的动画循环
+      if (mainAnimationFrameRef.current) {
+        cancelAnimationFrame(mainAnimationFrameRef.current);
+        mainAnimationFrameRef.current = undefined;
+      }
     };
   }, []);
 
@@ -674,9 +1183,9 @@ export default function PerformanceStage() {
     processedIndicesRef.current.clear();
     processedActionsRef.current.clear();
     
-    // 初始化音符气泡（初始为空，后续根据动作动态生成）
-    setLeftBubbles([]);
-    setRightBubbles([]);
+    // ✅ 性能优化：直接重置 ref
+    leftBubblesRef.current = [];
+    rightBubblesRef.current = [];
     
     console.log('🎭 开始表演，清理所有状态');
     
@@ -715,13 +1224,14 @@ export default function PerformanceStage() {
       processedIndicesRef.current.clear();
       processedActionsRef.current.clear();
       setActionHints([]);
-      setLeftBubbles([]);
-      setRightBubbles([]);
+      // ✅ 性能优化：直接重置 ref
+      leftBubblesRef.current = [];
+      rightBubblesRef.current = [];
+      particlesRef.current = [];
       setScore(0);
       setCombo(0);
       scoreRef.current = 0; // ✅ 重置 ref
       comboRef.current = 0; // ✅ 重置 ref
-      setParticles([]);
 
       // 2. 延迟执行：确保 DOM 已经渲染，且 video 标签已挂载
       const timer = setTimeout(() => {
@@ -747,75 +1257,24 @@ export default function PerformanceStage() {
     }
   }, [stage, startPerformance]);
 
-  // 更新音符气泡位置（基于音频时间精确同步）
+  // ✅ 性能优化：统一的动画循环（更新粒子和气泡，并绘制到 Canvas）
   useEffect(() => {
-    if (stage !== 'performing' || !audioRef.current) return;
+    if (stage !== 'performing') return;
 
-    const JUDGE_LINE_Y = window.innerHeight * 0.2; // 判定线位置
-
-    const updateBubbles = () => {
-      const audioTime = audioRef.current?.currentTime || 0;
-      const deltaTime = 1 / 60; // 固定帧率 60fps
-
-      // 更新左侧气泡
-      setLeftBubbles(prev => prev
-        .map(bubble => {
-          // 如果有目标时间，进行精确同步检查
-          if (bubble.targetTime !== undefined) {
-            const timeDiff = audioTime - bubble.targetTime;
-            // 如果已经超过目标时间 0.2 秒，检查是否到达判定线
-            if (timeDiff > 0.2) {
-              // 如果气泡已经通过判定线，标记为已处理
-              if (bubble.y > JUDGE_LINE_Y + 50) {
-                return null;
-              }
-            }
-          }
-
-          let newY = bubble.y + bubble.speed * (deltaTime * 60);
-          if (newY > window.innerHeight + 100) {
-            return null;
-          }
-          return { ...bubble, y: newY };
-        })
-        .filter((bubble): bubble is NoteBubble => bubble !== null)
-      );
-
-      // 更新右侧气泡
-      setRightBubbles(prev => prev
-        .map(bubble => {
-          // 如果有目标时间，进行精确同步检查
-          if (bubble.targetTime !== undefined) {
-            const timeDiff = audioTime - bubble.targetTime;
-            // 如果已经超过目标时间 0.2 秒，检查是否到达判定线
-            if (timeDiff > 0.2) {
-              // 如果气泡已经通过判定线，标记为已处理
-              if (bubble.y > JUDGE_LINE_Y + 50) {
-                return null;
-              }
-            }
-          }
-
-          let newY = bubble.y + bubble.speed * (deltaTime * 60);
-          if (newY > window.innerHeight + 100) {
-            return null;
-          }
-          return { ...bubble, y: newY };
-        })
-        .filter((bubble): bubble is NoteBubble => bubble !== null)
-      );
-
-      animationFrameRef.current = requestAnimationFrame(updateBubbles);
+    const animate = () => {
+      drawEffects();
+      mainAnimationFrameRef.current = requestAnimationFrame(animate);
     };
 
-    animationFrameRef.current = requestAnimationFrame(updateBubbles);
+    mainAnimationFrameRef.current = requestAnimationFrame(animate);
 
     return () => {
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
+      if (mainAnimationFrameRef.current) {
+        cancelAnimationFrame(mainAnimationFrameRef.current);
+        mainAnimationFrameRef.current = undefined;
       }
     };
-  }, [stage]);
+  }, [stage, drawEffects]);
 
   // ✅ 下载视频功能（使用 useCallback 优化）
   const handleDownloadVideo = useCallback(() => {
@@ -947,9 +1406,9 @@ export default function PerformanceStage() {
           cancelAnimationFrame(syncLoopRef.current);
           syncLoopRef.current = undefined;
         }
-        if (animationFrameRef.current) {
-          cancelAnimationFrame(animationFrameRef.current);
-          animationFrameRef.current = undefined;
+        if (mainAnimationFrameRef.current) {
+          cancelAnimationFrame(mainAnimationFrameRef.current);
+          mainAnimationFrameRef.current = undefined;
         }
         if (gestureIntervalRef.current) {
           clearInterval(gestureIntervalRef.current);
@@ -1177,10 +1636,11 @@ export default function PerformanceStage() {
                 isLeft
               });
               
+              // ✅ 性能优化：直接更新 ref
               if (isLeft) {
-                setLeftBubbles(prev => [...prev, newBubble]);
+                leftBubblesRef.current = [...leftBubblesRef.current, newBubble];
               } else {
-                setRightBubbles(prev => [...prev, newBubble]);
+                rightBubblesRef.current = [...rightBubblesRef.current, newBubble];
               }
             }
           }
@@ -1240,8 +1700,8 @@ export default function PerformanceStage() {
         const actionTime = parseTimestampToSeconds(action.timestamp);
         const timeDiff = currentTime - actionTime;
 
-        // 在动作时间点触发手势效果（数据驱动）
-        if (timeDiff >= 0 && timeDiff <= 0.2 && !processedActionsRef.current.has(action.id + 10000)) {
+        // ✅ 放宽触发窗口：从0.2秒扩大到0.5秒，更容易触发
+        if (timeDiff >= 0 && timeDiff <= 0.5 && !processedActionsRef.current.has(action.id + 10000)) {
           processedActionsRef.current.add(action.id + 10000);
           triggerGesture(action);
         }
@@ -1253,27 +1713,7 @@ export default function PerformanceStage() {
   };
 
 
-  // 更新粒子
-  useEffect(() => {
-    if (stage !== 'performing') return;
-
-    const updateParticles = () => {
-      setParticles(prev => 
-        prev
-          .map(p => ({
-            ...p,
-            x: p.x + p.vx,
-            y: p.y + p.vy,
-            vy: p.vy + 0.1, // 重力
-            life: p.life + 1
-          }))
-          .filter(p => p.life < p.maxLife)
-      );
-    };
-
-    const interval = setInterval(updateParticles, 16);
-    return () => clearInterval(interval);
-  }, [stage]);
+  // ✅ 已移除：粒子更新逻辑已合并到统一的 drawEffects 函数中
 
   // 处理开始按钮
   const handleStart = () => {
@@ -1549,9 +1989,9 @@ export default function PerformanceStage() {
             </div>
           </div>
 
-          {/* 左侧音符气泡 */}
+          {/* ✅ 性能优化：气泡和粒子现在通过 Canvas 统一绘制，不再使用 DOM 元素 */}
+          {/* 保留波浪线背景（静态 SVG，不影响性能） */}
           <div className="absolute left-8 top-0 bottom-0 w-24 z-20 pointer-events-none">
-            {/* 波浪线背景 */}
             <svg className="absolute inset-0 w-full h-full opacity-20" viewBox="0 0 100 1000">
               <path
                 d="M 50 0 Q 20 100 50 200 T 50 400 T 50 600 T 50 800 T 50 1000"
@@ -1567,25 +2007,9 @@ export default function PerformanceStage() {
                 </linearGradient>
               </defs>
             </svg>
-
-            {/* 气泡 */}
-            {leftBubbles.map(bubble => (
-              <div
-                key={bubble.id}
-                className={`absolute left-1/2 -translate-x-1/2 rounded-full bg-gradient-to-br ${bubble.color} shadow-[0_0_30px_rgba(6,182,212,0.5)]`}
-                style={{
-                  top: `${bubble.y}px`,
-                  width: `${bubble.size}px`,
-                  height: `${bubble.size}px`,
-                  opacity: bubble.opacity
-                }}
-              />
-            ))}
           </div>
 
-          {/* 右侧音符气泡 */}
           <div className="absolute right-8 top-0 bottom-0 w-24 z-20 pointer-events-none">
-            {/* 波浪线背景 */}
             <svg className="absolute inset-0 w-full h-full opacity-20" viewBox="0 0 100 1000">
               <path
                 d="M 50 0 Q 80 100 50 200 T 50 400 T 50 600 T 50 800 T 50 1000"
@@ -1601,20 +2025,6 @@ export default function PerformanceStage() {
                 </linearGradient>
               </defs>
             </svg>
-
-            {/* 气泡 */}
-            {rightBubbles.map(bubble => (
-              <div
-                key={bubble.id}
-                className={`absolute left-1/2 -translate-x-1/2 rounded-full bg-gradient-to-br ${bubble.color} shadow-[0_0_30px_rgba(20,184,166,0.5)]`}
-                style={{
-                  top: `${bubble.y}px`,
-                  width: `${bubble.size}px`,
-                  height: `${bubble.size}px`,
-                  opacity: bubble.opacity
-                }}
-              />
-            ))}
           </div>
 
           {/* 主舞台区域 */}
@@ -1710,7 +2120,7 @@ export default function PerformanceStage() {
                 <div className="absolute inset-0 border-4 border-green-400 rounded-3xl animate-pulse" />
               )}
 
-              {/* 2. 新增：Canvas (必须放在 Video 之上，且同样需要镜像以匹配手的位置) */}
+              {/* 2. Canvas (必须放在 Video 之上，且同样需要镜像以匹配手的位置) */}
               <canvas
                 ref={canvasRef}
                 width={1280}  // 设置为摄像头分辨率
@@ -1718,27 +2128,12 @@ export default function PerformanceStage() {
                 className="absolute inset-0 w-full h-full object-cover scale-x-[-1] pointer-events-none"
               />
 
-              {/* 粒子层 */}
-              <div className="absolute inset-0 pointer-events-none">
-                {particles.map(particle => {
-                  const opacity = 1 - (particle.life / particle.maxLife);
-                  return (
-                    <div
-                      key={particle.id}
-                      className="absolute rounded-full"
-                      style={{
-                        left: `${particle.x}px`,
-                        top: `${particle.y}px`,
-                        width: `${particle.size}px`,
-                        height: `${particle.size}px`,
-                        backgroundColor: particle.color,
-                        opacity,
-                        boxShadow: `0 0 ${particle.size * 2}px ${particle.color}`
-                      }}
-                    />
-                  );
-                })}
-              </div>
+              {/* ✅ 性能优化：新增统一的特效 Canvas（绘制粒子和气泡） */}
+              <canvas
+                ref={effectsCanvasRef}
+                className="absolute inset-0 w-full h-full pointer-events-none"
+                style={{ zIndex: 10 }}
+              />
 
               {/* 用户标签 */}
               <div className="absolute top-4 left-4 px-4 py-2 bg-black/40 backdrop-blur-md rounded-full border border-white/10">
@@ -1833,6 +2228,29 @@ export default function PerformanceStage() {
 
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+        
+        /* ✅ 粒子特效动画 */
+        @keyframes pulse {
+          0%, 100% {
+            opacity: 1;
+            transform: scale(1);
+          }
+          50% {
+            opacity: 0.7;
+            transform: scale(1.2);
+          }
+        }
+        
+        @keyframes twinkle {
+          0%, 100% {
+            opacity: 1;
+            transform: scale(1) rotate(0deg);
+          }
+          50% {
+            opacity: 0.5;
+            transform: scale(1.3) rotate(180deg);
+          }
+        }
       `}</style>
     </div>
   );

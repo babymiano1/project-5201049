@@ -2,7 +2,9 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useVideoAnalysis } from '../../contexts/VideoAnalysisContext';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+// ✅ Vercel 部署：在生产环境使用相对路径，开发环境使用 localhost
+const API_BASE_URL = import.meta.env.VITE_API_URL || 
+  (import.meta.env.PROD ? '' : 'http://localhost:3001');
 
 export default function AIParsing() {
   const navigate = useNavigate();
