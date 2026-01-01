@@ -1,3 +1,5 @@
+import { Hands, Results } from '@mediapipe/hands';
+import { Camera } from '@mediapipe/camera_utils';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { useVideoAnalysis, type ActionItem } from '../../contexts/VideoAnalysisContext';
@@ -196,6 +198,13 @@ export default function PerformanceStage() {
   const [handDetected, setHandDetected] = useState(false);
   const [lastGestureTime, setLastGestureTime] = useState(0);
 
+  // new
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingTime, setRecordingTime] = useState(0);
+  const [showShareModal, setShowShareModal] = useState(false); // 如果需要录制结束后的弹窗
+  const [finalScore, setFinalScore] = useState(0); // ✅ 最终分数（冻结）
+  const [finalCombo, setFinalCombo] = useState(0); // ✅ 最终连击（冻结）
+
   // Refs
   const videoRef = useRef<HTMLVideoElement>(null); // 右侧：用户摄像头
   const originalVideoRef = useRef<HTMLVideoElement>(null); // 左侧：原视频
@@ -210,6 +219,274 @@ export default function PerformanceStage() {
   const syncLoopRef = useRef<number | undefined>(undefined); // requestAnimationFrame ID for sync loop
   const processedIndicesRef = useRef<Set<number>>(new Set<number>()); // 记录已触发的动作下标
   const lastDebugTimeRef = useRef<number>(0); // 用于每秒打印一次日志
+
+  // new refs
+  const canvasRef = useRef<HTMLCanvasElement>(null); // 用于绘制骨骼
+  const handsRef = useRef<Hands | null>(null);       // MediaPipe 实例
+  const cameraRef = useRef<Camera | null>(null);     // MediaPipe Camera 工具
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const scoreRef = useRef<number>(0); // ✅ 用于保存最新分数，确保冻结时获取最新值
+  const comboRef = useRef<number>(0); // ✅ 用于保存最新连击，确保冻结时获取最新值
+
+  // ✅ 绘制手部骨骼（提取为独立函数）
+  const drawHandSkeleton = useCallback((
+    ctx: CanvasRenderingContext2D,
+    landmarks: any[],
+    width: number,
+    height: number
+  ) => {
+    const connections = [
+      [0, 1], [1, 2], [2, 3], [3, 4],
+      [0, 5], [5, 6], [6, 7], [7, 8],
+      [0, 9], [9, 10], [10, 11], [11, 12],
+      [0, 13], [13, 14], [14, 15], [15, 16],
+      [0, 17], [17, 18], [18, 19], [19, 20],
+      [5, 9], [9, 13], [13, 17]
+    ];
+
+    ctx.strokeStyle = '#06b6d4';
+    ctx.lineWidth = 3;
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = '#06b6d4';
+
+    connections.forEach(([start, end]) => {
+      const startPoint = landmarks[start];
+      const endPoint = landmarks[end];
+
+      ctx.beginPath();
+      ctx.moveTo(startPoint.x * width, startPoint.y * height);
+      ctx.lineTo(endPoint.x * width, endPoint.y * height);
+      ctx.stroke();
+    });
+
+    ctx.fillStyle = '#14b8a6';
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = '#14b8a6';
+
+    landmarks.forEach((landmark) => {
+      ctx.beginPath();
+      ctx.arc(landmark.x * width, landmark.y * height, 5, 0, 2 * Math.PI);
+      ctx.fill();
+    });
+
+    ctx.shadowBlur = 0;
+  }, []);
+
+  // ✅ 创建粒子（基于 action_tag 和 intensity，数据驱动）- 提前定义以便其他函数使用
+  const createParticles = useCallback((x: number, y: number, colorGradient: string, intensity: number) => {
+    // 从渐变色字符串中提取主要颜色（简化处理）
+    const colorMap: Record<string, string> = {
+      'from-blue-400 to-cyan-400': '#06b6d4',
+      'from-purple-400 to-pink-400': '#8b5cf6',
+      'from-yellow-400 to-orange-400': '#f59e0b',
+      'from-pink-400 to-rose-400': '#ec4899',
+      'from-green-400 to-teal-400': '#14b8a6',
+      'from-red-400 to-pink-400': '#ef4444',
+      'from-indigo-400 to-purple-400': '#6366f1',
+      'from-teal-400 to-cyan-400': '#14b8a6',
+      'from-gray-400 to-gray-500': '#9ca3af',
+    };
+    
+    const particleColor = colorMap[colorGradient] || '#8b5cf6';
+    const particleCount = 15 + Math.floor(intensity / 2); // 基于 intensity 决定粒子数量
+    const newParticles: Particle[] = [];
+
+    for (let i = 0; i < particleCount; i++) {
+      const angle = (Math.PI * 2 * i) / particleCount;
+      // 速度基于 intensity（1-10），映射到 2-4
+      const speed = 2 + (intensity / 10) * 2;
+      
+      // ✅ 修复 ID 冲突：使用 Date.now() + Math.random() 生成唯一 ID
+      newParticles.push({
+        id: Date.now() + Math.random() + i,
+        x,
+        y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 1.0,
+        maxLife: 1.0,
+        color: particleColor,
+        size: 3 + Math.random() * 3
+      });
+    }
+
+    setParticles(prev => [...prev, ...newParticles]);
+  }, []);
+
+  // ✅ 触发手势效果（基于 action 数据）- 提前定义以便其他函数使用
+  const triggerGesture = useCallback((action: ActionItem) => {
+    const now = Date.now();
+    if (now - lastGestureTime < 300) return; // 防止过于频繁
+    
+    setLastGestureTime(now);
+    setHandDetected(true);
+    setTimeout(() => setHandDetected(false), 300);
+
+    // 根据 intensity 计算分数（数据驱动）
+    const baseScore = 50 + action.intensity * 10;
+    setScore(prev => {
+      const newScore = prev + baseScore;
+      scoreRef.current = newScore; // ✅ 同步更新 ref
+      return newScore;
+    });
+    
+    // 如果是节奏点，增加连击
+    if (action.rhythm_point) {
+      setCombo(prev => {
+        const newCombo = prev + 1;
+        comboRef.current = newCombo; // ✅ 同步更新 ref
+        return newCombo;
+      });
+    }
+
+    // 生成粒子（基于 action_tag 的颜色）
+    const config = ACTION_TAG_CONFIG[action.action_tag] || {
+      icon: '✨',
+      color: 'from-purple-400 to-pink-400',
+      bubbleColor: 'from-purple-400 to-pink-400'
+    };
+    createParticles(200, 300, config.color, action.intensity);
+  }, [createParticles]);
+
+  // ✅ 碰撞检测逻辑（使用 useCallback 优化）
+  const checkBubbleCollision = useCallback((handX: number, handY: number) => {
+    if (!canvasRef.current) return;
+    
+    const hitRadius = 50; // 判定范围
+    const canvasWidth = canvasRef.current.width;
+    const JUDGE_LINE_Y = window.innerHeight * 0.2;
+    
+    // 检查左侧气泡
+    setLeftBubbles(prev => prev.filter(bubble => {
+      // 计算气泡在 Canvas 坐标系中的 Y 位置（需要考虑气泡的 y 是相对于窗口的）
+      const bubbleCanvasY = (bubble.y / window.innerHeight) * canvasRef.current!.height;
+      const isHit = Math.abs(handY - bubbleCanvasY) < hitRadius && 
+                    handX < canvasWidth / 2 &&
+                    Math.abs(bubble.y - JUDGE_LINE_Y) < 50; // 气泡接近判定线
+      
+      if (isHit) {
+        // 触发得分和特效
+        const hitAction: ActionItem = { 
+          id: bubble.id, 
+          action_tag: 'HIT', 
+          description: '击中气泡',
+          intensity: 5, 
+          timestamp: '0:00.0',
+          rhythm_point: false
+        };
+        triggerGesture(hitAction); 
+        return false; // 移除气泡
+      }
+      return true;
+    }));
+    
+    // 检查右侧气泡
+    setRightBubbles(prev => prev.filter(bubble => {
+      const bubbleCanvasY = (bubble.y / window.innerHeight) * canvasRef.current!.height;
+      const isHit = Math.abs(handY - bubbleCanvasY) < hitRadius && 
+                    handX >= canvasWidth / 2 &&
+                    Math.abs(bubble.y - JUDGE_LINE_Y) < 50; // 气泡接近判定线
+      
+      if (isHit) {
+        const hitAction: ActionItem = { 
+          id: bubble.id, 
+          action_tag: 'HIT', 
+          description: '击中气泡',
+          intensity: 5, 
+          timestamp: '0:00.0',
+          rhythm_point: false
+        };
+        triggerGesture(hitAction); 
+        return false; // 移除气泡
+      }
+      return true;
+    }));
+  }, [triggerGesture]);
+
+  // ✅ 处理识别结果并绘制（使用 useCallback 优化）
+  const onHandsResults = useCallback((results: Results) => {
+    if (!canvasRef.current) return;
+    
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // 清空画布
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+      setHandDetected(true);
+      
+      results.multiHandLandmarks.forEach((landmarks) => {
+        // 绘制手部骨骼
+        drawHandSkeleton(ctx, landmarks, canvas.width, canvas.height);
+
+        // 获取食指指尖坐标 (Index 8)
+        const indexTip = landmarks[8]; 
+        const x = indexTip.x * canvas.width;
+        const y = indexTip.y * canvas.height;
+
+        // 检测碰撞：判断手是否碰到了气泡
+        checkBubbleCollision(x, y); 
+      });
+    } else {
+      setHandDetected(false);
+    }
+  }, [drawHandSkeleton, checkBubbleCollision]);
+
+  // ✅ 初始化手势跟踪（使用 useCallback 优化）
+  const initHandTracking = useCallback(() => {
+    // 必须确保 video 和 canvas 都已存在
+    if (!videoRef.current || !canvasRef.current) {
+      console.warn("MediaPipe 等待 DOM 元素中...");
+      return;
+    }
+
+    // 如果已经初始化过了，不要重复创建 Camera，避免内存泄漏
+    if (cameraRef.current || handsRef.current) {
+      console.warn("MediaPipe 已经初始化，跳过重复初始化");
+      return;
+    }
+
+    try {
+      const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
+      });
+
+      hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      });
+
+      hands.onResults(onHandsResults);
+      handsRef.current = hands;
+
+      // 使用 Camera Utils 自动将 videoRef 的帧送入 hands 处理
+      const camera = new Camera(videoRef.current, {
+        onFrame: async () => {
+          if (videoRef.current && handsRef.current) {
+            try {
+              await handsRef.current.send({ image: videoRef.current });
+            } catch (error) {
+              console.warn('⚠️ 手势识别发送失败:', error);
+            }
+          }
+        },
+        width: 1280,
+        height: 720
+      });
+
+      camera.start();
+      cameraRef.current = camera;
+      console.log('✅ MediaPipe Hands 初始化成功');
+    } catch (error) {
+      console.error('❌ MediaPipe Hands 初始化失败:', error);
+    }
+  }, [onHandsResults]);
 
   // 初始化摄像头
   useEffect(() => {
@@ -362,6 +639,35 @@ export default function PerformanceStage() {
     }
   }, [stage, countdown]);
 
+  useEffect(() => {
+    // 这个返回函数会在组件销毁或 stage 改变时执行
+    return () => {
+      console.log('🧹 正在清理 MediaPipe 和录制资源...');
+      
+      // 停止录制
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
+      
+      // 停止 MediaPipe 相机工具
+      if (cameraRef.current) {
+        cameraRef.current.stop();
+        cameraRef.current = null;
+      }
+  
+      // 关闭手势检测实例
+      if (handsRef.current) {
+        handsRef.current.close();
+        handsRef.current = null;
+      }
+  
+      // 清理计时器
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+      }
+    };
+  }, [stage]); // 监听阶段变化，一旦离开 performing 自动执行清理
+
   // 开始表演
   const startPerformance = useCallback(async () => {
     // 清理已处理的下标记录，准备新的表演
@@ -401,31 +707,43 @@ export default function PerformanceStage() {
     startGestureDetection();
   }, [videoAnalysisState.videoUrl, videoAnalysisState.analysisResult]);
 
-  // 当进入 performing 阶段时启动表演
+  // --- 修改后的 useEffect ---
   useEffect(() => {
     if (stage === 'performing') {
-      // ✅ 重置逻辑：显式执行状态清理
-      console.log('🔄 进入 performing 阶段，执行状态重置');
-      
-      // 清空已处理动作
+      // 1. 立即执行：同步状态清理（防止旧数据闪现）
+      console.log('🔄 执行状态重置');
       processedIndicesRef.current.clear();
       processedActionsRef.current.clear();
-      
-      // 清空气泡数组
       setActionHints([]);
       setLeftBubbles([]);
       setRightBubbles([]);
-      
-      // 重置分数和连击
       setScore(0);
       setCombo(0);
-      
-      // 清理粒子
+      scoreRef.current = 0; // ✅ 重置 ref
+      comboRef.current = 0; // ✅ 重置 ref
       setParticles([]);
-      
-      console.log('✅ 状态重置完成，准备开始表演');
-      
-      startPerformance();
+
+      // 2. 延迟执行：确保 DOM 已经渲染，且 video 标签已挂载
+      const timer = setTimeout(() => {
+        // 检查引用是否已准备好
+        if (!videoRef.current) {
+          console.error("❌ 找不到 Video 引用，手势识别启动失败");
+          return;
+        }
+
+        console.log('🚀 启动手势识别与录制');
+        
+        // 按照依赖顺序启动
+        initHandTracking(); // 先初始化算法
+        startRecording();   // 再开始录制（此时画面已稳定）
+        startPerformance(); // 最后开始业务逻辑（产生气泡等）
+        
+      }, 500); // 500ms 是一个安全的缓冲时间
+
+      return () => {
+        clearTimeout(timer);
+        // 在这里添加清理逻辑（见下文第3点）
+      };
     }
   }, [stage, startPerformance]);
 
@@ -499,6 +817,209 @@ export default function PerformanceStage() {
     };
   }, [stage]);
 
+  // ✅ 下载视频功能（使用 useCallback 优化）
+  const handleDownloadVideo = useCallback(() => {
+    if (recordedChunksRef.current.length === 0) {
+      console.warn('⚠️ 没有录制数据可下载');
+      return;
+    }
+    const blob = new Blob(recordedChunksRef.current, { type: 'video/webm' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `performance-${Date.now()}.webm`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    console.log('✅ 视频下载完成');
+  }, []);
+
+  // ✅ 格式化录制时间
+  const formatTime = useCallback((seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }, []);
+
+  // ✅ 分享功能 - 改为只分享到抖音（参考 page-performance-stage.tsx）
+  const handleShare = useCallback(() => {
+    // 生成有网感的文案
+    const emotionalTexts = [
+      '要说晚安了吗？还是继续在音乐里沉沦',
+      '跨年可以跨进你心里吗？反正我已经跨进音乐里了',
+      '一秒钟的瞬间就已注定，我和这段旋律的相遇',
+      '今晚的月亮不营业，我来营业',
+      '慢慢来吧，反正来日方长',
+      '人间烟火气，最抚凡人心，但音乐更懂我',
+      '别慌，月亮也正在大海某处迷茫',
+      '我贩卖黄昏，只为收集世间温柔',
+      '落日余晖的路上，总有人在等你',
+      '世界很大，幸好有音乐',
+      '慢热的人真可怜，别人已经腻了，你才刚刚着迷',
+      '想把所有的夜晚都给你，让你在我的梦里做主角',
+      '我在贩卖日落，你像神明一样慷慨地将光撒向我',
+      '温柔要有，但不是妥协，我们要在安静中，不慌不忙地坚强',
+      '别否定自己，你特别好，特别温柔，特别值得'
+    ];
+    
+    const randomText = emotionalTexts[Math.floor(Math.random() * emotionalTexts.length)];
+    const hashtags = '#AI音乐创作 #即兴演奏 #音乐治愈 #深夜emo';
+    const shareText = `${randomText} ${hashtags}`;
+    
+    // 复制到剪贴板
+    navigator.clipboard.writeText(shareText).then(() => {
+      // 提示用户
+      alert('文案已复制！\n\n请打开抖音APP，粘贴文案并上传你的表演视频 🎵');
+    }).catch(() => {
+      alert('复制失败，请手动复制文案');
+    });
+  }, []);
+
+  // ✅ 开始录制功能（使用 useCallback 优化）
+  const startRecording = useCallback(() => {
+    if (!streamRef.current) {
+      console.warn('⚠️ 无法开始录制：摄像头流不存在');
+      return;
+    }
+
+    setIsRecording(true);
+    setRecordingTime(0);
+    recordedChunksRef.current = [];
+
+    try {
+      // 创建 MediaRecorder
+      const mediaRecorder = new MediaRecorder(streamRef.current, {
+        mimeType: 'video/webm;codecs=vp9'
+      });
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          recordedChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = () => {
+        console.log("✅ 录制结束，生成 Blob");
+        setIsRecording(false);
+        if (recordingTimerRef.current) {
+          clearInterval(recordingTimerRef.current);
+          recordingTimerRef.current = null;
+        }
+        
+        // ✅ 冻结分数和连击（使用 ref 获取最新值，避免闭包问题）
+        setFinalScore(scoreRef.current);
+        setFinalCombo(comboRef.current);
+        console.log('📊 冻结分数:', { score: scoreRef.current, combo: comboRef.current });
+        
+        // ✅ 关闭摄像头
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach(track => {
+            track.stop();
+            console.log('🛑 摄像头轨道已停止:', track.kind);
+          });
+          streamRef.current = null;
+        }
+        
+        // ✅ 停止 MediaPipe 手势识别
+        if (cameraRef.current) {
+          try {
+            cameraRef.current.stop();
+            cameraRef.current = null;
+            console.log('🛑 MediaPipe Camera 已停止');
+          } catch (error) {
+            console.warn('⚠️ 停止 MediaPipe Camera 失败:', error);
+          }
+        }
+        
+        if (handsRef.current) {
+          try {
+            handsRef.current.close();
+            handsRef.current = null;
+            console.log('🛑 MediaPipe Hands 已关闭');
+          } catch (error) {
+            console.warn('⚠️ 关闭 MediaPipe Hands 失败:', error);
+          }
+        }
+        
+        // ✅ 停止所有动画循环
+        if (syncLoopRef.current) {
+          cancelAnimationFrame(syncLoopRef.current);
+          syncLoopRef.current = undefined;
+        }
+        if (animationFrameRef.current) {
+          cancelAnimationFrame(animationFrameRef.current);
+          animationFrameRef.current = undefined;
+        }
+        if (gestureIntervalRef.current) {
+          clearInterval(gestureIntervalRef.current);
+          gestureIntervalRef.current = undefined;
+        }
+        
+        // ✅ 显示分享弹窗，而不是自动下载
+        setShowShareModal(true);
+      };
+
+      mediaRecorder.start(1000); // 每 1 秒收集一次数据
+      mediaRecorderRef.current = mediaRecorder;
+
+      // 计时器
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingTime(prev => prev + 1);
+      }, 1000);
+
+      console.log('🎬 开始录制用户表演');
+    } catch (error) {
+      console.error('❌ 录制启动失败:', error);
+      setIsRecording(false);
+    }
+  }, [handleDownloadVideo]);
+
+  // ✅ 停止录制功能（使用 useCallback 优化）
+  const handleStopRecording = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      try {
+        // ✅ 先冻结分数（使用 ref 获取最新值）
+        setFinalScore(scoreRef.current);
+        setFinalCombo(comboRef.current);
+        console.log('📊 停止录制时冻结分数:', { score: scoreRef.current, combo: comboRef.current });
+        
+        mediaRecorderRef.current.stop();
+        setIsRecording(false);
+        if (recordingTimerRef.current) {
+          clearInterval(recordingTimerRef.current);
+          recordingTimerRef.current = null;
+        }
+        console.log('🛑 停止录制');
+        // ✅ 停止录制后，onstop 回调会自动处理摄像头关闭和显示分享弹窗
+      } catch (error) {
+        console.error('❌ 停止录制失败:', error);
+        setIsRecording(false);
+        // ✅ 即使出错也要冻结分数和关闭摄像头（使用 ref 获取最新值）
+        setFinalScore(scoreRef.current);
+        setFinalCombo(comboRef.current);
+        if (streamRef.current) {
+          streamRef.current.getTracks().forEach(track => track.stop());
+          streamRef.current = null;
+        }
+        if (recordedChunksRef.current.length > 0) {
+          setShowShareModal(true);
+        }
+      }
+    } else {
+      console.warn('⚠️ MediaRecorder 不存在或已停止');
+      // ✅ 即使 MediaRecorder 状态异常，也冻结分数、关闭摄像头并显示分享弹窗（使用 ref 获取最新值）
+      setFinalScore(scoreRef.current);
+      setFinalCombo(comboRef.current);
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+      }
+      if (recordedChunksRef.current.length > 0) {
+        setShowShareModal(true);
+      }
+    }
+  }, [score, combo]);
   // 基于视频时间轴同步动作提示（使用 requestAnimationFrame 高频同步检查）
   useEffect(() => {
     if (stage !== 'performing' || !originalVideoRef.current) return;
@@ -731,69 +1252,6 @@ export default function PerformanceStage() {
     gestureIntervalRef.current = window.setInterval(checkGestures, 50);
   };
 
-  // 触发手势效果（基于 action 数据）
-  const triggerGesture = (action: ActionItem) => {
-    const now = Date.now();
-    if (now - lastGestureTime < 300) return; // 防止过于频繁
-    
-    setLastGestureTime(now);
-    setHandDetected(true);
-    setTimeout(() => setHandDetected(false), 300);
-
-    // 根据 intensity 计算分数（数据驱动）
-    const baseScore = 50 + action.intensity * 10;
-    setScore(prev => prev + baseScore);
-    
-    // 如果是节奏点，增加连击
-    if (action.rhythm_point) {
-      setCombo(prev => prev + 1);
-    }
-
-    // 生成粒子（基于 action_tag 的颜色）
-    const config = ACTION_TAG_CONFIG[action.action_tag] || DEFAULT_CONFIG;
-    createParticles(200, 300, config.color, action.intensity);
-  };
-
-  // 创建粒子（基于 action_tag 和 intensity，数据驱动）
-  const createParticles = (x: number, y: number, colorGradient: string, intensity: number) => {
-    // 从渐变色字符串中提取主要颜色（简化处理）
-    const colorMap: Record<string, string> = {
-      'from-blue-400 to-cyan-400': '#06b6d4',
-      'from-purple-400 to-pink-400': '#8b5cf6',
-      'from-yellow-400 to-orange-400': '#f59e0b',
-      'from-pink-400 to-rose-400': '#ec4899',
-      'from-green-400 to-teal-400': '#14b8a6',
-      'from-red-400 to-pink-400': '#ef4444',
-      'from-indigo-400 to-purple-400': '#6366f1',
-      'from-teal-400 to-cyan-400': '#14b8a6',
-      'from-gray-400 to-gray-500': '#9ca3af',
-    };
-    
-    const particleColor = colorMap[colorGradient] || '#8b5cf6';
-    const particleCount = 15 + Math.floor(intensity / 2); // 基于 intensity 决定粒子数量
-    const newParticles: Particle[] = [];
-
-    for (let i = 0; i < particleCount; i++) {
-      const angle = (Math.PI * 2 * i) / particleCount;
-      // 速度基于 intensity（1-10），映射到 2-4
-      const speed = 2 + (intensity / 10) * 2;
-      
-      // ✅ 修复 ID 冲突：使用 Date.now() + Math.random() 生成唯一 ID
-      newParticles.push({
-        id: Date.now() + Math.random() + i, // 添加 i 确保同一批次内的唯一性
-        x,
-        y,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
-        life: 1,
-        maxLife: 50 + intensity * 5, // 基于 intensity 决定生命周期
-        color: particleColor,
-        size: 4 + (intensity / 10) * 4 // 基于 intensity 决定大小
-      });
-    }
-
-    setParticles(prev => [...prev, ...newParticles]);
-  };
 
   // 更新粒子
   useEffect(() => {
@@ -1252,6 +1710,14 @@ export default function PerformanceStage() {
                 <div className="absolute inset-0 border-4 border-green-400 rounded-3xl animate-pulse" />
               )}
 
+              {/* 2. 新增：Canvas (必须放在 Video 之上，且同样需要镜像以匹配手的位置) */}
+              <canvas
+                ref={canvasRef}
+                width={1280}  // 设置为摄像头分辨率
+                height={720}
+                className="absolute inset-0 w-full h-full object-cover scale-x-[-1] pointer-events-none"
+              />
+
               {/* 粒子层 */}
               <div className="absolute inset-0 pointer-events-none">
                 {particles.map(particle => {
@@ -1281,6 +1747,88 @@ export default function PerformanceStage() {
             </div>
           </div>
         </>
+      )}
+      {/* 录制控制按钮 - 仅在录制时显示 */}
+      {isRecording && stage === 'performing' && (
+        <div className="absolute bottom-8 left-1/2 -translate-x-1/2 z-50 flex items-center gap-4">
+          <div className="bg-black/60 backdrop-blur-md rounded-full px-6 py-3 border border-white/10 flex items-center gap-3">
+            <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse"></div>
+            <span className="text-white font-bold text-lg">{formatTime(recordingTime)}</span>
+          </div>
+          
+          <button
+            onClick={handleStopRecording}
+            className="px-8 py-3 bg-red-500 hover:bg-red-600 text-white rounded-full font-bold text-lg transition-colors cursor-pointer whitespace-nowrap shadow-lg flex items-center"
+          >
+            <i className="ri-stop-circle-line mr-2"></i>
+            停止录制
+          </button>
+        </div>
+      )}
+
+      {/* 分享弹窗 */}
+      {showShareModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm p-8">
+          <div className="bg-gradient-to-br from-slate-800 to-slate-900 rounded-3xl p-8 border border-white/10 max-w-lg w-full">
+            <div className="text-center mb-6">
+              <div className="w-20 h-20 mx-auto mb-4 rounded-full bg-gradient-to-br from-green-400 to-teal-400 flex items-center justify-center">
+                <i className="ri-check-line text-4xl text-white"></i>
+              </div>
+              <h2 className="text-2xl font-bold text-white mb-2">录制完成！</h2>
+              <p className="text-white/70 text-sm">你的精彩表演已保存</p>
+            </div>
+
+            {/* 成绩展示 - 使用冻结的最终分数 */}
+            <div className="bg-white/5 rounded-2xl p-6 mb-6 border border-white/10">
+              <div className="grid grid-cols-2 gap-4">
+                <div className="text-center">
+                  <div className="text-3xl font-black text-white mb-1">{finalScore}</div>
+                  <div className="text-sm text-white/60">总分</div>
+                </div>
+                <div className="text-center">
+                  <div className="text-3xl font-black text-yellow-400 mb-1">{finalCombo}</div>
+                  <div className="text-sm text-white/60">最高连击</div>
+                </div>
+              </div>
+            </div>
+
+            {/* 分享到抖音 */}
+            <div className="space-y-3 mb-6">
+              <button
+                onClick={handleShare}
+                className="w-full py-4 bg-gradient-to-r from-[#FF0050] to-[#00F2EA] hover:from-[#E6004A] hover:to-[#00DAD4] text-white rounded-2xl font-bold text-lg transition-all cursor-pointer whitespace-nowrap shadow-lg flex items-center justify-center gap-3"
+              >
+                <i className="ri-music-2-fill text-2xl"></i>
+                <span>分享到抖音</span>
+              </button>
+              
+              <p className="text-xs text-white/50 text-center leading-relaxed">
+                点击后将自动复制文案，打开抖音APP粘贴并上传视频即可
+              </p>
+            </div>
+
+            {/* 操作按钮 */}
+            <div className="flex gap-3">
+              <button
+                onClick={handleDownloadVideo}
+                className="flex-1 py-3 bg-white/10 hover:bg-white/15 text-white rounded-full font-medium transition-colors cursor-pointer whitespace-nowrap border border-white/20"
+              >
+                <i className="ri-download-line mr-2"></i>
+                下载视频
+              </button>
+              <button
+                onClick={() => {
+                  setShowShareModal(false);
+                  // 可以选择返回首页或重新开始
+                  window.location.href = '/';
+                }}
+                className="flex-1 py-3 bg-white/90 hover:bg-white text-black rounded-full font-bold transition-colors cursor-pointer whitespace-nowrap"
+              >
+                返回首页
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       <style>{`

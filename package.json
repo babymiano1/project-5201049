@@ -1,6 +1,6 @@
 {
   "dependencies": {
-    "@mediapipe/camera_utils": "^0.3.1675465747",
+    "@mediapipe/camera_utils": "^0.3.1675466862",
     "@mediapipe/drawing_utils": "^0.3.1675465747",
     "@mediapipe/hands": "^0.4.1675469240",
     "@stripe/react-stripe-js": "4.0.2",

@@ -11,16 +11,16 @@ export default function Home() {
   const exampleVideos = [
     {
       id: 1,
-      title: '节奏手势舞+电音钢琴',
-      thumbnail: 'https://readdy.ai/api/search-image?query=A%20minimalist%20abstract%20blob%20shape%20with%20soft%20pastel%20gradient%20colors%20from%20yellow%20to%20pink%20to%20purple%2C%20floating%20on%20pure%20black%20background%2C%20smooth%20rounded%20organic%20form%2C%20gentle%20glow%20effect%2C%20modern%20minimalist%20aesthetic%2C%20clean%20composition%2C%20high%20quality%20digital%20art&width=280&height=420&seq=example1v2&orientation=portrait',
+      title: '圣诞节氛围感',
+      videoPath: '/demo_1.mp4', // ✅ 使用 public 目录的相对路径
       duration: '0:45',
       actions: 15,
       notes: 12
     },
     {
       id: 2,
-      title: '卡点短剧+爵士鼓',
-      thumbnail: 'https://readdy.ai/api/search-image?query=A%20minimalist%20abstract%20blob%20shape%20with%20soft%20pastel%20gradient%20colors%20from%20cyan%20to%20blue%20to%20purple%2C%20floating%20on%20pure%20black%20background%2C%20smooth%20rounded%20organic%20form%2C%20gentle%20glow%20effect%2C%20modern%20minimalist%20aesthetic%2C%20clean%20composition%2C%20high%20quality%20digital%20art&width=280&height=420&seq=example2v2&orientation=portrait',
+      title: '手势舞入门教程',
+      videoPath: '/demo_2.mp4', // ✅ 使用 public 目录的相对路径
       duration: '1:20',
       actions: 22,
       notes: 18
@@ -120,7 +120,7 @@ export default function Home() {
         {/* Example Videos */}
         <div>
           <div className="flex items-center justify-between mb-6 px-2">
-            <h2 className="text-xl font-bold text-white">示例视频</h2>
+            <h2 className="text-xl font-bold text-white">热门素材库</h2>
             <span className="text-sm text-white/40">点击直接进入解析</span>
           </div>
 
@@ -131,15 +131,22 @@ export default function Home() {
                 onClick={() => handleExampleClick(video.id)}
                 className="group relative bg-white/5 backdrop-blur-sm rounded-[28px] overflow-hidden border border-white/10 hover:border-white/20 transition-all cursor-pointer hover:scale-[1.02]"
               >
-                {/* Thumbnail */}
-                <div className="relative aspect-[2/3] overflow-hidden rounded-t-[28px]">
-                  <div className="w-full h-full">
-                    <img
-                      src={video.thumbnail}
-                      alt={video.title}
-                      className="w-full h-full object-cover object-center group-hover:scale-105 transition-transform duration-700"
-                    />
-                  </div>
+                {/* Video */}
+                <div className="relative aspect-[2/3] overflow-hidden rounded-t-[28px] bg-black">
+                  <video
+                    src={video.videoPath}
+                    className="w-full h-full object-cover object-center group-hover:scale-105 transition-transform duration-700"
+                    muted
+                    loop
+                    playsInline
+                    onMouseEnter={(e) => {
+                      e.currentTarget.play().catch(() => {});
+                    }}
+                    onMouseLeave={(e) => {
+                      e.currentTarget.pause();
+                      e.currentTarget.currentTime = 0;
+                    }}
+                  />
                   
                   {/* Play overlay */}
                   <div className="absolute inset-0 bg-black/30 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity duration-300">
