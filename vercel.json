@@ -3,12 +3,6 @@
   "buildCommand": "npm run build",
   "outputDirectory": "out",
   "framework": "vite",
-  "functions": {
-    "api/**/*.js": {
-      "runtime": "nodejs20.x",
-      "maxDuration": 60
-    }
-  },
   "rewrites": [
     {
       "source": "/api/:path*",
